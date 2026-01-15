@@ -245,7 +245,8 @@ class PPO:
                 kl_mean = torch.mean(kl)
 
                 if dist.is_initialized():
-                    kl_mean = dist.all_reduce(kl_mean, op=dist.ReduceOp.SUM) / dist.get_world_size()
+                    dist.all_reduce(kl_mean, op=dist.ReduceOp.SUM)
+                    kl_mean /= dist.get_world_size()
 
                 if kl_mean > self.desired_kl * 2.0:
                     self.learning_rate = max(1e-5, self.learning_rate / 1.5)
