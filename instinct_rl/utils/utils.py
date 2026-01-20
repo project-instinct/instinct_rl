@@ -182,6 +182,23 @@ def get_subobs_by_components(observations, component_names, obs_segments: Ordere
     return torch.cat(subobs, dim=-1) if cat else subobs
 
 
+def get_subobs_indexing_by_components(obs_segments: OrderedDict, component_names: List[str]) -> torch.Tensor:
+    """Get the indexing of the subobs by the component names, which may be used by torch.gather with the index array to
+    extract the subobs.
+    Args:
+        obs_segments: The observation segments.
+        component_names: The component names to extract.
+    Returns:
+        The indexing of the subobs as a tensor of shape (subobs_size,).
+    """
+    index_arrays = []
+    for component in obs_segments.keys():
+        if component in component_names:
+            obs_slice, obs_shape = get_obs_slice(obs_segments, component)
+            index_arrays.append(torch.arange(obs_slice.start, obs_slice.stop))
+    return torch.cat(index_arrays)
+
+
 def replace_obs_components(
     observations: torch.Tensor, target_components: List[str], replace_vec: torch.Tensor, obs_segments: OrderedDict
 ):
