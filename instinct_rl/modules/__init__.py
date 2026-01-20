@@ -7,7 +7,7 @@ from .all_mixer import (
     EncoderMoEActorCritic,
     EncoderStateAc,
     EncoderStateAcRecurrent,
-    EncoderVaeActor,
+    EncoderVaeActorCritic,
 )
 from .discriminator import Discriminator
 from .encoder_actor_critic import EncoderActorCritic, EncoderActorCriticRecurrent
@@ -22,7 +22,7 @@ from .state_estimator import (
     EstimatorActorCriticRecurrent,
     EstimatorMixin,
 )
-from .vae_actor import VaeActor
+from .vae_actor_critic import VaeActorCritic
 
 
 def build_actor_critic(

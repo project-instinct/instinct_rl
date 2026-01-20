@@ -5,7 +5,7 @@ from .actor_critic_recurrent import ActorCriticRecurrent
 from .encoder_actor_critic import EncoderActorCriticMixin
 from .moe_actor_critic import MoEActorCritic
 from .state_estimator import EstimatorMixin
-from .vae_actor import VaeActor
+from .vae_actor_critic import VaeActorCritic
 
 
 class EncoderStateAc(EstimatorMixin, EncoderActorCriticMixin, ActorCritic):
@@ -21,5 +21,5 @@ class EncoderMoEActorCritic(EncoderActorCriticMixin, MoEActorCritic):
     pass
 
 
-class EncoderVaeActor(EncoderActorCriticMixin, VaeActor):
+class EncoderVaeActorCritic(EncoderActorCriticMixin, VaeActorCritic):
     pass

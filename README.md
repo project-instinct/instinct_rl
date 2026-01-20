@@ -89,9 +89,9 @@ Implementation of WASABI, starting from the algorithm framework of AMP. Uses adv
 
 Teacher-student distillation framework that extends PPO with teacher network guidance. Implements Dataset Aggregation (DAgger) and knowledge distillation techniques. Allows learning from expert demonstrations while maintaining PPO's stability guarantees. Supports various teacher action selection probabilities and distillation loss coefficients.
 
-### AE (VAE)
+### VAE Distillation
 
-Variational Autoencoder implementation for unsupervised learning of latent representations. Can be used for dimensionality reduction, feature learning, or as part of a larger reinforcement learning pipeline.
+Teacher-student distillation framework that extends TPPO with a VAE student network. Uses a VAE to encode and decode to generate the student's action. It generates additional latent distribution separate from the action distribution, which enables the potential of VAE-distillation combined with PPO.
 
 ---
 
@@ -104,6 +104,10 @@ Standard actor-critic architecture with separate policy (actor) and value (criti
 ### MoE Actor Critic
 
 Mixture of Experts (MoE) extension of the actor-critic architecture. Uses multiple expert networks with a gating mechanism to specialize different experts on different parts of the state/action space. Can improve performance on complex tasks by allowing specialization while maintaining parameter efficiency.
+
+### VAE Actor Critic
+
+Variational Autoencoder (VAE) extension of the actor-critic architecture. Uses a VAE to learn a latent representation of the observation, and then uses the actor to predict the action from the latent representation. Can be used for dimensionality reduction, feature learning, or as part of a larger reinforcement learning pipeline.
 
 ### Encoder related modules
 

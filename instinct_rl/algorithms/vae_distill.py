@@ -38,10 +38,10 @@ class VaeAlgoMixin:
 
         # VAE losses
         kl_loss = torch.zeros_like(minibatch.obs[..., 0])
-        if hasattr(self.actor_critic, "distribution") and self.actor_critic.distribution is not None:
-            # For VaeActor - use the VAE distribution directly
+        if hasattr(self.actor_critic, "latent_distribution") and self.actor_critic.latent_distribution is not None:
+            # For VaeActor - use the VAE latent distribution directly
             kl_loss += self.kl_loss_func(
-                self.actor_critic.distribution,
+                self.actor_critic.latent_distribution,
                 self.normal_dist,
             ).sum(dim=-1)
 
