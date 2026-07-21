@@ -60,7 +60,22 @@ class EmpiricalNormalization(nn.Module):
     def update(self, x):
         """Learn input values without computing the output values of them"""
 
+        if self.count < 0:
+            # count overflowed (int64) or was loaded from a corrupted checkpoint. Freeze the statistics:
+            # continuing to update with a negative count makes `rate` negative, which diverges the running
+            # mean to +-inf and poisons every normalized observation.
+            print(
+                f"[EmpiricalNormalization] Error: count is negative ({self.count.item()}),"
+                " freezing normalizer statistics. Check resumed checkpoints and multi-process sync."
+            )
+            return
         if self.until is not None and self.count >= self.until:
+            return
+
+        # skip learning from non-finite batches: a single nan/inf batch would permanently poison the
+        # running mean/variance (and spread to all processes in the next sync).
+        if not torch.isfinite(x).all():
+            print("[EmpiricalNormalization] Warning: skipping statistics update for a nan/inf batch.")
             return
 
         count_x = x.shape[0]
@@ -97,6 +112,16 @@ class EmpiricalNormalization(nn.Module):
         local_mean = self._mean.squeeze(0)
         local_var = self._var.squeeze(0)
         local_count = self.count
+
+        # do not contribute poisoned statistics to the shared running estimate
+        if local_count < 0 or not torch.isfinite(local_mean).all() or not torch.isfinite(local_var).all():
+            print(
+                "[EmpiricalNormalization] Warning: local statistics are invalid (negative count or nan/inf),"
+                " excluding this process from the sync."
+            )
+            local_mean = torch.zeros_like(local_mean)
+            local_var = torch.zeros_like(local_var)
+            local_count = torch.zeros_like(local_count)
 
         # Gather counts as int64 to avoid float32 precision loss / overflow
         all_counts = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(world_size)]
