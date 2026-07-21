@@ -16,14 +16,14 @@ from torch import nn
 class EmpiricalNormalization(nn.Module):
     """Normalize mean and variance of values based on empirical values."""
 
-    def __init__(self, shape, eps=1e-2, until=None):
+    def __init__(self, shape, eps=1e-2, until=2**62):
         """Initialize EmpiricalNormalization module.
 
         Args:
             shape (int or tuple of int): Shape of input values except batch axis.
             eps (float): Small value for stability.
-            until (int or None): If this arg is specified, the link learns input values until the sum of batch sizes
-            exceeds it.
+            until (int): If this arg is specified, the link learns input values until the sum of batch sizes
+            exceeds it. By default is int64.max / 2 constant.
         """
         super().__init__()
         self.eps = eps
@@ -88,13 +88,23 @@ class EmpiricalNormalization(nn.Module):
     def sync_across_processes(self):
         if not dist.is_initialized() or dist.get_world_size() == 1:
             return
+        if self.until is not None and self.count >= self.until:
+            return
 
         world_size = dist.get_world_size()
         device = self._mean.device
 
         local_mean = self._mean.squeeze(0)
         local_var = self._var.squeeze(0)
-        local_count = self.count.float()
+        local_count = self.count
+
+        # Gather counts as int64 to avoid float32 precision loss / overflow
+        all_counts = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(world_size)]
+        dist.all_gather(all_counts, local_count.unsqueeze(0))
+        all_counts = [c.squeeze() for c in all_counts]
+        total_count = torch.stack(all_counts).sum()
+        if total_count <= 0:  # int64 overflow or zero total
+            return
 
         all_means = [torch.zeros_like(local_mean) for _ in range(world_size)]
         dist.all_gather(all_means, local_mean)
@@ -102,24 +112,20 @@ class EmpiricalNormalization(nn.Module):
         all_vars = [torch.zeros_like(local_var) for _ in range(world_size)]
         dist.all_gather(all_vars, local_var)
 
-        all_counts = [torch.zeros(1, device=device) for _ in range(world_size)]
-        dist.all_gather(all_counts, local_count.unsqueeze(0))
-        all_counts = [c.squeeze() for c in all_counts]
+        # Use float64 for precise weighted average
+        all_counts_d = [c.double() for c in all_counts]
+        total_count_d = total_count.double()
 
-        total_count = sum(all_counts)
-        if total_count == 0:
-            return
-
-        global_mean = sum(m * c for m, c in zip(all_means, all_counts)) / total_count
+        global_mean = sum(m * c for m, c in zip(all_means, all_counts_d)) / total_count_d
         global_var = sum(
             c * (v + (m - global_mean) ** 2)
-            for m, v, c in zip(all_means, all_vars, all_counts)
-        ) / total_count
+            for m, v, c in zip(all_means, all_vars, all_counts_d)
+        ) / total_count_d
 
         self._mean = global_mean.unsqueeze(0)
         self._var = global_var.unsqueeze(0)
         self._std = torch.sqrt(self._var)
-        self.count = total_count.long()
+        self.count = total_count  # stays int64
 
     def export(self, path):
         np.savez(
