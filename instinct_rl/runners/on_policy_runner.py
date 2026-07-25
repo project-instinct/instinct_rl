@@ -431,14 +431,13 @@ class OnPolicyRunner:
         torch.save(run_state_dict, path)
 
     def load(self, path):
-        """Load training state dict from file. Will not happen if in multi-process and not rank 0."""
-        if self.is_mp_rank_other_process():
-            return
+        """Load training state dict from file. (even for multi-processes)"""
 
         loaded_dict = torch.load(path, weights_only=True)
         if self.cfg.get("ckpt_manipulator", False):
             # suppose to be a string specifying which function to use
-            print("\033[1;36m Warning: using a hacky way to load the model. \033[0m")
+            if not self.is_mp_rank_other_process():
+                print("\033[1;36m Warning: using a hacky way to load the model. \033[0m")
             if ":" in self.cfg["ckpt_manipulator"]:
                 ckpt_manipulator_module = importlib.import_module(self.cfg["ckpt_manipulator"].split(":")[0])
                 ckpt_manipulator_func = getattr(ckpt_manipulator_module, self.cfg["ckpt_manipulator"].split(":")[1])
@@ -449,21 +448,23 @@ class OnPolicyRunner:
                 self.alg.state_dict(),
                 **self.cfg.get("ckpt_manipulator_kwargs", {}),
             )
-            print("\033[1;36m Done: using a hacky way to load the model. \033[0m")
+            if not self.is_mp_rank_other_process():
+                print("\033[1;36m Done: using a hacky way to load the model. \033[0m")
 
         self.alg.load_state_dict(loaded_dict)
 
         for group_name, normalizer in self.normalizers.items():
-            if not f"{group_name}_normalizer_state_dict" in loaded_dict:
-                print(
-                    f"\033[1;36m Warning, normalizer for {group_name} is not found, the state dict is not loaded"
-                    " \033[0m"
-                )
+            if f"{group_name}_normalizer_state_dict" not in loaded_dict:
+                if not self.is_mp_rank_other_process():
+                    print(
+                        f"\033[1;36m Warning, normalizer for {group_name} is not found, the state dict is not loaded"
+                        " \033[0m"
+                    )
             else:
                 normalizer.load_state_dict(loaded_dict[f"{group_name}_normalizer_state_dict"])
 
         self.current_learning_iteration = loaded_dict["iter"]
-        if self.cfg.get("ckpt_manipulator", False):
+        if self.cfg.get("ckpt_manipulator", False) and (not self.is_mp_rank_other_process()):
             try:
                 os.makedirs(self.log_dir, exist_ok=True)
                 self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
