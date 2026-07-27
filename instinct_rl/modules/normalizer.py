@@ -32,6 +32,13 @@ class EmpiricalNormalization(nn.Module):
         self.register_buffer("_var", torch.ones(shape).unsqueeze(0))
         self.register_buffer("_std", torch.ones(shape).unsqueeze(0))
         self.register_buffer("count", torch.tensor(0, dtype=torch.long))
+        # Since-last-sync increments: in multi-process training, sync_across_processes() merges only
+        # these into the shared estimate - merging full local estimates would re-count the shared
+        # history x world_size per sync and overflow int64. Non-persistent so that old checkpoints
+        # stay loadable with strict=True.
+        self.register_buffer("_inc_mean", torch.zeros(shape).unsqueeze(0), persistent=False)
+        self.register_buffer("_inc_var", torch.ones(shape).unsqueeze(0), persistent=False)
+        self.register_buffer("_inc_count", torch.tensor(0, dtype=torch.long), persistent=False)
 
     @property
     def mean(self):
@@ -61,9 +68,8 @@ class EmpiricalNormalization(nn.Module):
         """Learn input values without computing the output values of them"""
 
         if self.count < 0:
-            # count overflowed (int64) or was loaded from a corrupted checkpoint. Freeze the statistics:
-            # continuing to update with a negative count makes `rate` negative, which diverges the running
-            # mean to +-inf and poisons every normalized observation.
+            # count overflowed (int64) or the checkpoint is corrupt: freeze, otherwise the negative
+            # `rate` would diverge the running mean and poison every normalized observation.
             print(
                 f"[EmpiricalNormalization] Error: count is negative ({self.count.item()}),"
                 " freezing normalizer statistics. Check resumed checkpoints and multi-process sync."
@@ -72,22 +78,32 @@ class EmpiricalNormalization(nn.Module):
         if self.until is not None and self.count >= self.until:
             return
 
-        # skip learning from non-finite batches: a single nan/inf batch would permanently poison the
-        # running mean/variance (and spread to all processes in the next sync).
+        # skip non-finite batches: one nan/inf batch would permanently poison the running stats
+        # (and spread to all processes in the next sync).
         if not torch.isfinite(x).all():
             print("[EmpiricalNormalization] Warning: skipping statistics update for a nan/inf batch.")
             return
 
         count_x = x.shape[0]
-        self.count += count_x
-        rate = count_x / self.count
-
         var_x = torch.var(x, dim=0, unbiased=False, keepdim=True)
         mean_x = torch.mean(x, dim=0, keepdim=True)
-        delta_mean = mean_x - self._mean
-        self._mean += rate * delta_mean
-        self._var += rate * (var_x - self._var + delta_mean * (mean_x - self._mean))
-        self._std = torch.sqrt(self._var)
+        multi_process = dist.is_initialized() and dist.get_world_size() > 1
+        # multi-process: accumulate only the since-last-sync increment; the shared estimate is
+        # advanced exclusively by sync_across_processes(). Single-process behavior is unchanged.
+        mean_buf = self._inc_mean if multi_process else self._mean
+        var_buf = self._inc_var if multi_process else self._var
+        count_buf = self._inc_count if multi_process else self.count
+
+        new_count = count_buf + count_x
+        rate = count_x / new_count
+        delta_mean = mean_x - mean_buf
+        mean_buf += rate * delta_mean
+        var_buf += rate * (var_x - var_buf + delta_mean * (mean_x - mean_buf))
+        if multi_process:
+            self._inc_count = new_count
+        else:
+            self.count = new_count
+            self._std = torch.sqrt(self._var)
 
     @torch.jit.unused
     def inverse(self, y):
@@ -101,56 +117,57 @@ class EmpiricalNormalization(nn.Module):
             dist.broadcast(buffer, src=0)
 
     def sync_across_processes(self):
+        """Pool every process's since-last-sync increment into the shared running estimate.
+
+        The shared estimate (identical on all ranks) joins the merge as one more participant,
+        keeping `count` the true global sample count.
+        """
         if not dist.is_initialized() or dist.get_world_size() == 1:
             return
         if self.until is not None and self.count >= self.until:
             return
 
-        world_size = dist.get_world_size()
-        device = self._mean.device
-
-        local_mean = self._mean.squeeze(0)
-        local_var = self._var.squeeze(0)
-        local_count = self.count
-
-        # do not contribute poisoned statistics to the shared running estimate
+        # do not contribute a poisoned increment to the shared running estimate
+        local_count, local_mean, local_var = self._inc_count, self._inc_mean, self._inc_var
         if local_count < 0 or not torch.isfinite(local_mean).all() or not torch.isfinite(local_var).all():
             print(
-                "[EmpiricalNormalization] Warning: local statistics are invalid (negative count or nan/inf),"
-                " excluding this process from the sync."
+                "[EmpiricalNormalization] Warning: local increment statistics are invalid (negative count"
+                " or nan/inf), excluding this process from the sync."
             )
+            local_count = torch.zeros_like(local_count)
             local_mean = torch.zeros_like(local_mean)
             local_var = torch.zeros_like(local_var)
-            local_count = torch.zeros_like(local_count)
 
-        # Gather counts as int64 to avoid float32 precision loss / overflow
-        all_counts = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(world_size)]
-        dist.all_gather(all_counts, local_count.unsqueeze(0))
-        all_counts = [c.squeeze() for c in all_counts]
-        total_count = torch.stack(all_counts).sum()
-        if total_count <= 0:  # int64 overflow or zero total
+        # pack [count, mean, var] into a single float64 all_gather (counts exact up to 2**53)
+        payload = torch.cat([local_count.view(1).double(), local_mean.flatten().double(), local_var.flatten().double()])
+        gathered = [torch.empty_like(payload) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, payload)
+        gathered = torch.stack(gathered)  # (world_size, 1 + 2 * dim)
+
+        # merge participants: one increment per rank + the shared estimate (identical on all ranks)
+        dim = self._mean.numel()
+        counts = torch.cat([gathered[:, 0], self.count.double().view(1)])
+        means = torch.cat([gathered[:, 1 : 1 + dim], self._mean.double().reshape(1, -1)])
+        vars_ = torch.cat([gathered[:, 1 + dim :], self._var.double().reshape(1, -1)])
+
+        inc_total = counts[:-1].sum()
+        if inc_total <= 0:  # no new data anywhere (or int64 overflow)
             return
 
-        all_means = [torch.zeros_like(local_mean) for _ in range(world_size)]
-        dist.all_gather(all_means, local_mean)
+        # Chan parallel merge: global stats of the pooled (shared + increments) dataset
+        total = counts.sum()
+        global_mean = (counts.unsqueeze(1) * means).sum(0) / total
+        global_var = (counts.unsqueeze(1) * (vars_ + (means - global_mean) ** 2)).sum(0) / total
 
-        all_vars = [torch.zeros_like(local_var) for _ in range(world_size)]
-        dist.all_gather(all_vars, local_var)
-
-        # Use float64 for precise weighted average
-        all_counts_d = [c.double() for c in all_counts]
-        total_count_d = total_count.double()
-
-        global_mean = sum(m * c for m, c in zip(all_means, all_counts_d)) / total_count_d
-        global_var = sum(
-            c * (v + (m - global_mean) ** 2)
-            for m, v, c in zip(all_means, all_vars, all_counts_d)
-        ) / total_count_d
-
-        self._mean = global_mean.unsqueeze(0)
-        self._var = global_var.unsqueeze(0)
+        self._mean = global_mean.view_as(self._mean).to(self._mean.dtype)
+        self._var = global_var.view_as(self._var).to(self._var.dtype)
         self._std = torch.sqrt(self._var)
-        self.count = total_count  # stays int64
+        self.count += inc_total.long()
+
+        # the increments are now merged into the shared estimate; start a fresh increment
+        self._inc_mean.zero_()
+        self._inc_var.fill_(1.0)
+        self._inc_count.zero_()
 
     def export(self, path):
         np.savez(
