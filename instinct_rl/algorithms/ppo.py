@@ -55,6 +55,7 @@ class PPO:
         entropy_coef=0.0,
         learning_rate=1e-3,
         max_grad_norm=1.0,
+        max_grad_value=None,
         use_clipped_value_loss=True,
         clip_min_std=1e-15,  # clip the policy.std if it supports, check update()
         optimizer_class_name="Adam",
@@ -102,6 +103,7 @@ class PPO:
         self.gamma = gamma
         self.lam = lam
         self.max_grad_norm = max_grad_norm
+        self.max_grad_value = max_grad_value
         self.use_clipped_value_loss = use_clipped_value_loss
         self.clip_min_std = (
             torch.tensor(clip_min_std, device=self.device) if isinstance(clip_min_std, (tuple, list)) else clip_min_std
@@ -360,6 +362,8 @@ class PPO:
                 if param.grad is not None:
                     dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
                     param.grad.data /= world_size
+        if self.max_grad_value is not None:
+            nn.utils.clip_grad_value_(self.actor_critic.parameters(), self.max_grad_value)
         grad_norm = nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
         average_stats["grad_norm"] = average_stats["grad_norm"] + grad_norm.detach()
         self.optimizer.step()
