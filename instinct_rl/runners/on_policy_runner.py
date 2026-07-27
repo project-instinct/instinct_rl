@@ -304,7 +304,12 @@ class OnPolicyRunner:
             v = self.gather_stat_values(v, "mean")
             self.writer_mp_add_scalar("Loss/" + k, v.item(), self.current_learning_iteration)
         for k, v in locs["stats"].items():
-            v = self.gather_stat_values(v, "mean")
+            if "_max" in k:
+                v = self.gather_stat_values(v, "max")
+            elif "_min" in k:
+                v = self.gather_stat_values(v, "min")
+            else:
+                v = self.gather_stat_values(v, "mean")
             self.writer_mp_add_scalar("Train/" + k, v.item(), self.current_learning_iteration)
 
         self.writer_mp_add_scalar("Loss/learning_rate", self.alg.learning_rate, self.current_learning_iteration)

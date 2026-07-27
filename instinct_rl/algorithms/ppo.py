@@ -201,7 +201,14 @@ class PPO:
                 mean_losses[k] = mean_losses[k] + v.detach()
             mean_losses["total_loss"] = mean_losses["total_loss"] + loss.detach()
             for k, v in stats.items():
-                average_stats[k] = average_stats[k] + v.detach()
+                # *_max/*_min stats are kept as running extremes (not sums) so the runner can
+                # gather the worst-case across DDP ranks; everything else is summed then averaged.
+                if "_max" in k:
+                    average_stats[k] = torch.maximum(average_stats[k], v.detach()) if k in average_stats else v.detach()
+                elif "_min" in k:
+                    average_stats[k] = torch.minimum(average_stats[k], v.detach()) if k in average_stats else v.detach()
+                else:
+                    average_stats[k] = average_stats[k] + v.detach()
 
             # Gradient step
             self.gradient_step(loss, average_stats)
@@ -210,6 +217,8 @@ class PPO:
         for k in mean_losses.keys():
             mean_losses[k] = mean_losses[k] / num_updates
         for k in average_stats.keys():
+            if "_max" in k or "_min" in k:
+                continue  # already a running extreme, not a sum
             average_stats[k] = average_stats[k] / num_updates
         self.storage.clear()
         if hasattr(self.actor_critic, "clip_std"):
