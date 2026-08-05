@@ -22,7 +22,7 @@ class TwoStageRunner(OnPolicyRunner):
             device=self.alg.device,
         )
 
-    def rollout_step(self, obs, critic_obs):
+    def rollout_step(self, obs, extra_obs):
         # check if within the pretrain stage or RL stage
         if self.pretrain_iterations < 0 or self.current_learning_iteration < self.pretrain_iterations:
             transition, infos = self.rollout_dataset.get_transition_batch()
@@ -34,12 +34,14 @@ class TwoStageRunner(OnPolicyRunner):
                 self.alg.collect_transition_from_dataset(transition, infos)
                 return (
                     transition.next_observation,
-                    transition.next_privileged_observation,
+                    {"policy": transition.next_observation, "critic": transition.next_privileged_observation},
                     transition.reward,
                     transition.done,
                     infos,
                 )
             else:
                 obs, extras = self.env.get_observations()
-                critic_obs = extras["observations"].get("critic", obs)
-        return super().rollout_step(obs, critic_obs)
+                extra_obs = extras["observations"]
+                extra_obs.setdefault("policy", obs)
+                obs = self._prepare_extra_obs(extra_obs)
+        return super().rollout_step(obs, extra_obs)

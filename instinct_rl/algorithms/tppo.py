@@ -34,7 +34,8 @@ class TPPO(PPO):
         teacher_logdir=None,
         teacher_policy_class_name="ActorCritic",
         teacher_policy=dict(),
-        label_action_with_critic_obs=True,  # else, use actor obs
+        teacher_obs_key=None,  # the observation group fed to the teacher policy to produce action labels
+        label_action_with_critic_obs=None,  # DEPRECATED: use teacher_obs_key instead
         teacher_act_prob="exp",  # a number or a callable to (0 ~ 1) to the selection of act using teacher policy
         update_times_scale=100,  # a rough estimation of how many times the update will be called
         using_ppo=True,  # If False, compute_losses will skip ppo loss computation and returns to DAGGR
@@ -55,7 +56,14 @@ class TPPO(PPO):
         super().__init__(*args, **kwargs)
         self.teacher_logdir = teacher_logdir
         self.teacher_policy_cfg_dict = teacher_policy
-        self.label_action_with_critic_obs = label_action_with_critic_obs
+        if label_action_with_critic_obs is not None:
+            print(
+                "\033[43;33mWarning: `label_action_with_critic_obs` is deprecated, use `teacher_obs_key`"
+                " instead.\033[0m"
+            )
+            if teacher_obs_key is None:
+                teacher_obs_key = "critic" if label_action_with_critic_obs else "policy"
+        self.teacher_obs_key = teacher_obs_key if teacher_obs_key is not None else "critic"
         self.teacher_act_prob = teacher_act_prob
         self.update_times_scale = update_times_scale
         if isinstance(self.teacher_act_prob, str):
@@ -89,6 +97,10 @@ class TPPO(PPO):
             print(
                 "TPPO Warning: No snapshot loaded for teacher policy. Make sure you have a pretrained teacher network"
             )
+            # keep the teacher usable (e.g. for action labeling shape checks) even without a snapshot
+            self.teacher_actor_critic.to(self.device)
+            self.teacher_actor_critic.eval()
+            self.teacher_policy_normalizer = None
 
         # initialize lr scheduler if needed
         if not self.lr_scheduler_class_name is None:
@@ -125,23 +137,20 @@ class TPPO(PPO):
         else:
             self.teacher_policy_normalizer = None
 
-    def get_teacher_actions(self, obs, critic_obs=None):
-        if critic_obs is not None and self.label_action_with_critic_obs and self.action_labels_from_sample:
-            if self.teacher_policy_normalizer is not None:
-                critic_obs = self.teacher_policy_normalizer(critic_obs)
-            return self.teacher_actor_critic.act(critic_obs).detach()
-        elif critic_obs is not None and self.label_action_with_critic_obs:
-            if self.teacher_policy_normalizer is not None:
-                critic_obs = self.teacher_policy_normalizer(critic_obs)
-            return self.teacher_actor_critic.act_inference(critic_obs).detach()
-        elif self.action_labels_from_sample:
-            if self.teacher_policy_normalizer is not None:
-                obs = self.teacher_policy_normalizer(obs)
-            return self.teacher_actor_critic.act(obs).detach()
+    def get_teacher_actions(self, extra_obs: dict[str, torch.Tensor]):
+        """Compute the teacher action labels from the configured observation group (`teacher_obs_key`)."""
+        if self.teacher_obs_key not in extra_obs:
+            raise KeyError(
+                f"TPPO: teacher_obs_key '{self.teacher_obs_key}' is not found in the observation groups:"
+                f" {list(extra_obs.keys())}"
+            )
+        teacher_obs = extra_obs[self.teacher_obs_key]
+        if self.teacher_policy_normalizer is not None:
+            teacher_obs = self.teacher_policy_normalizer(teacher_obs)
+        if self.action_labels_from_sample:
+            return self.teacher_actor_critic.act(teacher_obs).detach()
         else:
-            if self.teacher_policy_normalizer is not None:
-                obs = self.teacher_policy_normalizer(obs)
-            return self.teacher_actor_critic.act_inference(obs).detach()
+            return self.teacher_actor_critic.act_inference(teacher_obs).detach()
 
     def init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards=1):
         self.transition = ActionLabelRollout.Transition()
@@ -158,10 +167,10 @@ class TPPO(PPO):
             device=self.device,
         )
 
-    def act(self, obs, critic_obs):
+    def act(self, obs, extra_obs):
         # get actions
-        return_ = super().act(obs, critic_obs)
-        self.transition.action_labels = self.get_teacher_actions(obs, critic_obs)
+        return_ = super().act(obs, extra_obs)
+        self.transition.action_labels = self.get_teacher_actions(extra_obs)
 
         # decide whose action to use
         if not hasattr(self, "use_teacher_act_mask"):
@@ -170,8 +179,8 @@ class TPPO(PPO):
 
         return return_
 
-    def process_env_step(self, rewards, dones, infos, next_obs, next_critic_obs):
-        return_ = super().process_env_step(rewards, dones, infos, next_obs, next_critic_obs)
+    def process_env_step(self, rewards, dones, infos, next_obs, next_extra_obs):
+        return_ = super().process_env_step(rewards, dones, infos, next_obs, next_extra_obs)
         self.teacher_actor_critic.reset(dones)
         # resample teacher action mask for those dones env
         self.use_teacher_act_mask[dones.to(bool)] = torch.rand(dones.sum(), device=self.device) < self.teacher_act_prob(
@@ -181,20 +190,21 @@ class TPPO(PPO):
 
     def collect_transition_from_dataset(self, transition, infos):
         """The interface to collect transition from dataset rather than env"""
-        super().act(transition.observation, transition.privileged_observation)
+        extra_obs = {"policy": transition.observation, "critic": transition.privileged_observation}
+        super().act(transition.observation, extra_obs)
         self.transition.action_labels = transition.action
         super().process_env_step(
             transition.reward,
             transition.done,
             infos,
             transition.next_observation,
-            transition.next_privileged_observation,
+            {"policy": transition.next_observation, "critic": transition.next_privileged_observation},
         )
 
-    def compute_returns(self, last_critic_obs):
+    def compute_returns(self, last_extra_obs):
         if not self.using_ppo:
             return
-        return super().compute_returns(last_critic_obs)
+        return super().compute_returns(last_extra_obs)
 
     def update(self, *args, **kwargs):
         return_ = super().update(*args, **kwargs)

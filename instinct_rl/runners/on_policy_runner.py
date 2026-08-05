@@ -124,10 +124,11 @@ class OnPolicyRunner:
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
         obs, extras = self.env.get_observations()
-        obs = obs.to(self.device)
-        critic_obs = extras["observations"].get("critic", None)
-        critic_obs = critic_obs.to(self.device) if critic_obs is not None else None
+        extra_obs = extras["observations"]
+        extra_obs.setdefault("policy", obs)
         self.train_mode()
+        # normalize the initial observations so that the first act() call sees normalized obs
+        obs = self._prepare_extra_obs(extra_obs)
 
         ep_infos = []
         step_infos = []
@@ -156,7 +157,7 @@ class OnPolicyRunner:
             # Rollout
             with torch.inference_mode(self.cfg.get("inference_mode_rollout", True)):
                 for i in range(self.num_steps_per_env):
-                    obs, critic_obs, rewards, dones, infos = self.rollout_step(obs, critic_obs)
+                    obs, extra_obs, rewards, dones, infos = self.rollout_step(obs, extra_obs)
                     if len(rewards.shape) == 1:
                         rewards = rewards.unsqueeze(-1)
 
@@ -185,7 +186,7 @@ class OnPolicyRunner:
 
                 # Learning step
                 start = stop
-                self.alg.compute_returns(critic_obs if critic_obs is not None else obs)
+                self.alg.compute_returns(extra_obs)
 
             losses, stats = self.alg.update(self.current_learning_iteration)
             stop = time.time()
@@ -204,29 +205,35 @@ class OnPolicyRunner:
 
         self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
-    def rollout_step(self, obs, critic_obs):
-        actions = self.alg.act(obs, critic_obs)
+    def rollout_step(self, obs, extra_obs):
+        actions = self.alg.act(obs, extra_obs)
         obs, rewards, dones, infos = self.env.step(actions)
-        critic_obs = infos["observations"].get("critic", None)
-        obs, critic_obs, rewards, dones = (
-            obs.to(self.device),
-            critic_obs.to(self.device) if critic_obs is not None else None,
-            rewards.to(self.device),
-            dones.to(self.device),
-        )
-        # Dealing with obs normalizers. At this line, obs and critic_obs and all observations in info are still flattened
+        extra_obs = infos["observations"]
+        extra_obs.setdefault("policy", obs)
+        rewards = rewards.to(self.device)
+        dones = dones.to(self.device)
+        # Dealing with obs normalizers. At this line, all observations in extra_obs are still flattened
+        obs = self._prepare_extra_obs(extra_obs)
+        self.alg.process_env_step(rewards, dones, infos, obs, extra_obs)
+        return obs, extra_obs, rewards, dones, infos
+
+    def _prepare_extra_obs(self, extra_obs: dict) -> torch.Tensor:
+        """Move all observation groups to the runner device and apply the configured normalizers.
+
+        The dict (which is `infos["observations"]` itself) is modified in-place, so the normalized
+        values are also what the algorithm sees in `process_env_step`.
+
+        Returns:
+            The (normalized) observation of the "policy" group.
+        """
+        for obs_group_name, group_obs in extra_obs.items():
+            if isinstance(group_obs, torch.Tensor):
+                extra_obs[obs_group_name] = group_obs.to(self.device)
         for obs_group_name, normalizer in self.normalizers.items():
-            if obs_group_name == "policy":
-                obs = normalizer(obs)
-                infos["observations"]["policy"] = obs
-            elif obs_group_name == "critic":
-                # Doesn't need to worry about `critic is None`. Otherwise, error shall occur when normalizers are being built
-                critic_obs = normalizer(critic_obs)
-                infos["observations"]["critic"] = critic_obs
-            else:
-                infos["observations"][obs_group_name] = normalizer(infos["observations"][obs_group_name])
-        self.alg.process_env_step(rewards, dones, infos, obs, critic_obs)
-        return obs, critic_obs, rewards, dones, infos
+            # A missing group raises a KeyError here. This is intended: the error shall occur when
+            # the normalizer for a non-existent group is configured.
+            extra_obs[obs_group_name] = normalizer(extra_obs[obs_group_name])
+        return extra_obs["policy"]
 
     """
     Logging

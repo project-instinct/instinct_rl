@@ -136,7 +136,16 @@ class PPO:
     def train_mode(self):
         self.actor_critic.train()
 
-    def act(self, obs, critic_obs):
+    def act(self, obs, extra_obs: dict[str, torch.Tensor] | None):
+        """
+        Args:
+            obs: the policy (actor) observation.
+            extra_obs: all observation groups from `infos["observations"]` (including "policy").
+                The "critic" group, if present, is used as the critic input and stored in the rollout
+                storage. Algorithms may consume additional groups from this dict.
+        """
+        critic_obs = extra_obs.get("critic", None) if extra_obs is not None else None
+
         if self.actor_critic.is_recurrent:
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
         # Compute the actions and values
@@ -150,7 +159,7 @@ class PPO:
         self.transition.critic_observations = critic_obs
         return self.transition.actions
 
-    def process_env_step(self, rewards, dones, infos, next_obs, next_critic_obs):
+    def process_env_step(self, rewards, dones, infos, next_obs, next_extra_obs: dict[str, torch.Tensor] | None):
         self.transition.rewards = rewards.clone()
 
         auxiliary_rewards = self.compute_auxiliary_reward(infos["observations"])
@@ -182,8 +191,17 @@ class PPO:
         """Compute the auxiliary reward depending on the algorithms. Default PPO does not have auxiliary reward."""
         return dict()
 
-    def compute_returns(self, last_critic_obs):
-        last_values = self.actor_critic.evaluate(last_critic_obs).detach()
+    def compute_returns(self, last_extra_obs: dict[str, torch.Tensor]):
+        """Bootstrap the returns with the value of the last observation.
+
+        Args:
+            last_extra_obs: all observation groups of the last step (including "policy"). The
+                "critic" group is used if present, otherwise falls back to "policy".
+        """
+        last_critic_obs = last_extra_obs.get("critic", None)
+        last_values = self.actor_critic.evaluate(
+            last_critic_obs if last_critic_obs is not None else last_extra_obs["policy"]
+        ).detach()
         self.storage.compute_returns(last_values, self.gamma, self.lam)
 
     def update(self, current_learning_iteration):

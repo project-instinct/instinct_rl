@@ -95,7 +95,7 @@ class WasabiAlgoMixin:
         if self.discriminator.normalizer is not None:
             self.discriminator.normalizer.init_broadcast()
 
-    def process_env_step(self, rewards, dones, infos, next_obs, next_critic_obs):
+    def process_env_step(self, rewards, dones, infos, next_obs, next_extra_obs):
         if not (self.actor_state_key in infos["observations"] and self.reference_state_key in infos["observations"]):
             raise ValueError(
                 "The key of trajectory observations ({}) or reference observations ({}) is not found in the observation"
@@ -113,7 +113,7 @@ class WasabiAlgoMixin:
         self.amp_transition.clear()
 
         # do not call compute_auxilary_reward here, because it is called in the baseclass function
-        super().process_env_step(rewards, dones, infos, next_obs, next_critic_obs)
+        super().process_env_step(rewards, dones, infos, next_obs, next_extra_obs)
 
     @torch.no_grad()
     def compute_auxiliary_reward(self, obs_pack: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
