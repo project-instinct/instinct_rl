@@ -12,6 +12,9 @@ See [CONTRIBUTORS.md](CONTRIBUTORS.md) for a list of acknowledged contributors.
 
 ## Install
 
+This branch requires Python `>=3.12,<3.13`, PyTorch `2.10.0`, TorchVision `0.25.0`, NumPy `>=2`,
+ONNX `>=1.18,<1.22`, and ONNX Script `>=0.5`.
+
 - Clone this repository separately from the Project Instinct installation:
 
   ```bash
@@ -21,7 +24,7 @@ See [CONTRIBUTORS.md](CONTRIBUTORS.md) for a list of acknowledged contributors.
   git clone git@github.com:project-instinct/instinct_rl.git
   ```
 
-- Install using any python interpreter
+- Install using a Python 3.12 interpreter:
 
   ```bash
   python -m pip install -e instinct_rl

@@ -186,7 +186,7 @@ class ParallelLayer(nn.Module):
             input_names=["input"],
             output_names=["output"],
             dynamo=True,
-            opset_version=15,  # on pytorch 2.4.0 for transformer encoder. Not sure for others.
+            opset_version=18,
         )
         exported_program.save(os.path.join(filedir, f"{self._sequential_idx}-{block_name}.onnx"))
         print(f"Exported {block_name} to {os.path.join(filedir, f'{self._sequential_idx}-{block_name}.onnx')}")

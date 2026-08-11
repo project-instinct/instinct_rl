@@ -137,7 +137,7 @@ class ActorCriticRecurrent(ActorCritic):
             os.path.join(filedir, "actor.onnx"),
             input_names=["input", "hidden"],
             output_names=["output", "hidden"],
-            opset_version=11,
+            opset_version=18,
         )
         print(f"Exported ActorCriticRecurrent model to {os.path.join(filedir, 'actor.onnx')}")
 

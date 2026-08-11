@@ -26,9 +26,19 @@ class MlpVae(nn.Module):
         self.decoder = MlpModel(**decoder_kwargs)
         self.latent_size = latent_size
 
-    def forward(self, x, decoder_aux_input: torch.Tensor = None) -> tuple[torch.Tensor, dist.Distribution]:
+    def forward_tensors(
+        self, x: torch.Tensor, decoder_aux_input: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the VAE and return only tensors for serialization and export."""
         z_mean, z_log_std = self.encoder(x).chunk(2, dim=-1)
-        z = z_mean + z_log_std.exp() * torch.randn_like(z_mean)
+        z_std = z_log_std.exp()
+        z = z_mean + z_std * torch.randn_like(z_mean)
         if decoder_aux_input is not None:
             z = torch.cat([z, decoder_aux_input], dim=-1)
-        return self.decoder(z), dist.Normal(z_mean, z_log_std.exp())
+        return self.decoder(z), z_mean, z_std
+
+    def forward(
+        self, x: torch.Tensor, decoder_aux_input: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, dist.Distribution]:
+        decoded, z_mean, z_std = self.forward_tensors(x, decoder_aux_input=decoder_aux_input)
+        return decoded, dist.Normal(z_mean, z_std)

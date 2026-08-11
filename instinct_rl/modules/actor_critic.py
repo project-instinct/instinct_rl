@@ -209,7 +209,7 @@ class ActorCritic(nn.Module):
                 os.path.join(filedir, "actor.onnx"),
                 input_names=["input"],
                 output_names=["output"],
-                opset_version=12,
+                opset_version=18,
             )
             print(f"Exported ActorCritic model to {os.path.join(filedir, 'actor.onnx')}")
 

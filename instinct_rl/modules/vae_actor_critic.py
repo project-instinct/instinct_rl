@@ -139,7 +139,7 @@ class VaeActorCritic(ActorCritic):
                 os.path.join(filedir, "vae_actor.onnx"),
                 input_names=["input"],
                 output_names=["output", "latent_mean", "latent_std"],
-                opset_version=12,
+                opset_version=18,
             )
             print(f"Exported VaeActorCritic model to {os.path.join(filedir, 'vae_actor.onnx')}")
 
@@ -192,17 +192,18 @@ class OnnxVaeNetwork(nn.Module):
             vae_aux_input = torch.gather(observations, 1, batch_aux_indices)
 
             # Forward through VAE
-            decoded_action, latent_dist = self.vae(vae_input, decoder_aux_input=vae_aux_input)
+            decoded_action, latent_mean, latent_std = self.vae.forward_tensors(
+                vae_input, decoder_aux_input=vae_aux_input
+            )
 
         elif self.vae_input_indices is None:
             # Use full observations as VAE input (no auxiliary input)
-            decoded_action, latent_dist = self.vae(observations)
+            decoded_action, latent_mean, latent_std = self.vae.forward_tensors(observations)
 
         else:
             # Only VAE input components, no auxiliary
             batch_input_indices = self.vae_input_indices.unsqueeze(0).expand(observations.shape[0], -1)
             vae_input = torch.gather(observations, 1, batch_input_indices)
-            decoded_action, latent_dist = self.vae(vae_input)
+            decoded_action, latent_mean, latent_std = self.vae.forward_tensors(vae_input)
 
-        # Return decoded action, latent mean, and latent std for ONNX compatibility
-        return decoded_action, latent_dist.mean, latent_dist.stddev
+        return decoded_action, latent_mean, latent_std

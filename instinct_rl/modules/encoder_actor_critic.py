@@ -132,7 +132,7 @@ class EncoderActorCriticMixin:
                     input_names=["input"],
                     output_names=["output"],
                     dynamo=True,
-                    opset=17,
+                    opset_version=18,
                 )
                 exported_program.save(os.path.join(filedir, "encoder_actor_critic.onnx"))
                 print(f"Exported encoder_actor_critic to {os.path.join(filedir, 'encoder_actor_critic.onnx')}")
