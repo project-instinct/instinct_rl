@@ -10,8 +10,8 @@ setup(
     description="Fast and simple RL algorithms implemented in pytorch",
     python_requires=">=3.12,<3.13",
     install_requires=[
-        "torch==2.10.0",
-        "torchvision==0.25.0",
+        "torch==2.11.0",
+        "torchvision==0.26.0",
         "numpy>=2",
         "tensorboardX",
         "tensorboard",

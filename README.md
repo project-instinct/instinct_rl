@@ -12,7 +12,7 @@ See [CONTRIBUTORS.md](CONTRIBUTORS.md) for a list of acknowledged contributors.
 
 ## Install
 
-This branch requires Python `>=3.12,<3.13`, PyTorch `2.10.0`, TorchVision `0.25.0`, NumPy `>=2`,
+This branch requires Python `>=3.12,<3.13`, PyTorch `2.11.0`, TorchVision `0.26.0`, NumPy `>=2`,
 ONNX `>=1.18,<1.22`, and ONNX Script `>=0.5`.
 
 - Clone this repository separately from the Project Instinct installation:
