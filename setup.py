@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="instinct_rl",
-    version="1.0.2",
+    version="1.0.3",
     author="Ziwen Zhuang",
     author_email="",
     license="BSD-3-Clause",
