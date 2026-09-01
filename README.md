@@ -1,10 +1,10 @@
 # Instinct RL (from Rsl-RL code base, but with lots of modificaitons)
 
 ## Warning
-This codebase is under [CC BY-NC 4.0 license](LICENSE), with inherited license in IsaacLab. You may not use the material for commercial purposes, e.g., to make demos to advertise your commercial products or wrap the code for your own commercial purposes.
+This codebase is released under the [Modified MIT License](LICENSE), based on the license used by Kimi K2. The license permits commercial use and adds a display requirement for commercial products or services above the user or revenue thresholds stated in the license. Third-party components and files with separate license notices remain subject to those notices.
 
 ## Contributing
-See our [Contributor Agreement](CONTRIBUTOR_AGREEMENT.md) for contribution guidelines. By contributing or submitting a pull request, you agree to transfer copyright ownership of your contributions to the project maintainers.
+See our [Contributor Agreement](CONTRIBUTOR_AGREEMENT.md) for contribution guidelines. By contributing or submitting a pull request, you grant the project maintainers a copyright license to your contribution while retaining your ownership of it.
 
 See [CONTRIBUTORS.md](CONTRIBUTORS.md) for a list of acknowledged contributors.
 

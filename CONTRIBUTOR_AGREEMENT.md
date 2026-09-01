@@ -2,17 +2,17 @@
 
 Thank you for your interest in contributing to InstinctRL! By submitting a pull request, you agree to the following terms:
 
-## 1. Copyright Transfer
+## 1. Copyright License
 You hereby grant to the InstinctRL maintainers and copyright holders a perpetual, worldwide, non-exclusive, royalty-free, irrevocable copyright license to use, reproduce, modify, distribute, and create derivative works of your contributions.
 
-## 2. License
-Your contributions will be licensed under the same CC BY-NC 4.0 license as the rest of the project.
+## 2. Project License
+Your contributions may be distributed under the same [Modified MIT License](LICENSE) as the rest of the project.
 
 ## 3. Attribution
-Contributors will be acknowledged in the project's contributor list, but copyright ownership transfers to the project maintainers.
+Contributors will be acknowledged in the project's contributor list and retain copyright ownership of their contributions.
 
-## 4. No Commercial Use
-All contributions are subject to the CC BY-NC 4.0 license, prohibiting commercial use by anyone.
+## 4. Large-Service Display Requirement
+Contributions distributed as part of Instinct RL are subject to the display requirement for commercial products or services above the user or revenue thresholds stated in the project's Modified MIT License.
 
 ## How to Contribute
 1. Fork the repository

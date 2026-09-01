@@ -5,7 +5,7 @@ setup(
     version="1.0.3",
     author="Ziwen Zhuang",
     author_email="",
-    license="BSD-3-Clause",
+    license="Modified MIT License",
     packages=find_packages(),
     description="Fast and simple RL algorithms implemented in pytorch",
     python_requires=">=3.12,<3.13",
