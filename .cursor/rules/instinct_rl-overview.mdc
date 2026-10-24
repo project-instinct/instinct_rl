@@ -25,6 +25,7 @@ Instinct-RL is a modular reinforcement learning library based on **Rsl-RL**, des
 - **AMP (WASABI)**: Adversarial Motion Priors for imitation learning.
 - **TPPO**: Teacher-student distillation (DAgger).
 - **VAE Distillation**: Distillation using a Variational Autoencoder student.
+- **SuperMimic**: World-model training without PPO (BPTT through imagined rollouts). It runs on the stock `OnPolicyRunner` (`init_storage` receives the env and the normalizers); the env defines the `world_model` observation group and `infos["terminal_observations"]`, the differentiable task is a `TaskModel`; `VisualSuperMimic` (`VisualLatentAlgoMixin` + `SuperMimic`, like `WasabiPPO`) adds a visual latent state for image policies (`VisualTaskModel`).
 
 ### 3. Modules (`instinct_rl.modules`)
 - **ActorCritic**: Base class for policy and value networks.
@@ -47,10 +48,10 @@ Instinct-RL is a modular reinforcement learning library based on **Rsl-RL**, des
 1.  **Location**: Create a new file in `instinct_rl/algorithms/`.
 2.  **Interface**: The algorithm must be compatible with `instinct_rl.runners.on_policy_runner.OnPolicyRunner`. Implement a class with the following methods:
     - `__init__(self, actor_critic, ...)`: Initialize components. The first argument is typically the network module.
-    - `act(self, obs, critic_obs)`: Compute actions given observations.
+    - `act(self, obs, extra_obs)`: Compute actions given the policy observation and all observation groups (`infos["observations"]`).
     - `process_env_step(self, rewards, dones, infos, ...)`: Handle environment transitions and storage.
     - `update(self, current_learning_iteration)`: Perform training update and return statistics.
-    - `init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards)`: Initialize rollout storage.
+    - `init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards, **kwargs)`: Initialize rollout storage. The runner also passes `env` and `normalizers` (keyword arguments) for algorithms that need them; ignore them otherwise.
     - `test_mode(self)` / `train_mode(self)`: Switch network modes.
     - `save(self, path)` / `load(self, path)`: Save/load algorithm state.
 3.  **Network Compatibility**:

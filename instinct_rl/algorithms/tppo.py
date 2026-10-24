@@ -152,7 +152,7 @@ class TPPO(PPO):
         else:
             return self.teacher_actor_critic.act_inference(teacher_obs).detach()
 
-    def init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards=1):
+    def init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards=1, **kwargs):
         self.transition = ActionLabelRollout.Transition()
         obs_size = get_subobs_size(obs_format["policy"])
         critic_obs_size = get_subobs_size(obs_format.get("critic")) if "critic" in obs_format else None

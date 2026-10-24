@@ -59,8 +59,8 @@ class WasabiAlgoMixin:
         self.discriminator_gradient_torlerance = discriminator_gradient_torlerance
         self.discriminator_backbone_gradient_only = discriminator_backbone_gradient_only
 
-    def init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards=1):
-        super().init_storage(num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards)
+    def init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards=1, **kwargs):
+        super().init_storage(num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards, **kwargs)
         # build discriminator
         if ":" in self.discriminator_class_name:
             DiscriminatorClass = getattr(

@@ -26,6 +26,14 @@ class VecEnv(ABC):
 
         - "critic": The observation is used as input to the critic network. Useful for asymmetric observation spaces.
         - "rnd_state": The observation is used as input to the RND network. Useful for random network distillation.
+        - "world_model": The observation is used by `SuperMimic`: the exact simulator state, the reference command, the
+          contacts and the episode-constant context (no noise, no history, see `SuperMimic` for the components).
+
+    - "terminal_observations" (dict[str, torch.Tensor], optional): The observation groups of the state right after the
+      step, BEFORE the environments that finished are reset (for all environments, with the same format as
+      `extras["observations"]`; the two are identical for the environments that did not finish). The environment
+      provides the groups it is asked for. It is needed by the algorithms that learn from the last state of an
+      episode, e.g. `SuperMimic` (group "world_model").
 
     - "time_outs" (torch.Tensor): Timeouts for the environments. These correspond to terminations that happen due to time limits and
       not due to the environment reaching a terminal state. This is useful for environments that have a fixed

@@ -112,10 +112,11 @@ class PPO:
         # algorithm status
         self.current_learning_iteration = 0
 
-    def init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards=1):
+    def init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards=1, **kwargs):
         """
         Args:
             num_rewards: int, in case of multi-reward setting, with multiple critic networks.
+            kwargs: The runner also gives `env` and `normalizers`, which PPO does not need.
         """
         self.transition = RolloutStorage.Transition()
         obs_size = get_subobs_size(obs_format["policy"])

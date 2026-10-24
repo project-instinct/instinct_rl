@@ -70,7 +70,11 @@ class OnPolicyRunner:
         ).to(self.device)
 
         alg_class_name = self.alg_cfg.pop("class_name")
-        alg_class = importlib.import_module() if ":" in alg_class_name else getattr(algorithms, alg_class_name)
+        if ":" in alg_class_name:
+            module_name, class_name = alg_class_name.split(":")
+            alg_class = getattr(importlib.import_module(module_name), class_name)
+        else:
+            alg_class = getattr(algorithms, alg_class_name)
         self.alg: algorithms.PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
 
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
@@ -88,13 +92,16 @@ class OnPolicyRunner:
             normalizer.to(self.device)
             self.normalizers[obs_group_name] = normalizer
 
-        # init storage and model
+        # init storage and model. The env and the normalizers are given for the algorithms that need them (e.g.
+        # SuperMimic builds its task model from the env and normalizes the imagined observations); the others ignore them.
         self.alg.init_storage(
             self.env.num_envs,
             self.num_steps_per_env,
             obs_format=obs_format,
             num_actions=self.env.num_actions,
             num_rewards=self.env.num_rewards,
+            env=self.env,
+            normalizers=self.normalizers,
         )
 
         # Log
@@ -400,8 +407,6 @@ class OnPolicyRunner:
             for k, v in locs["losses"].items():
                 log_string += f"""{k:>{pad}} {v.item():.4f}\n"""
             log_string += (
-                f"""{'Value function loss:':>{pad}} {locs["losses"]['value_loss']:.4f}\n"""
-                f"""{'Surrogate loss:':>{pad}} {locs["losses"]['surrogate_loss']:.4f}\n"""
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
                 # f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
                 # f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n"""

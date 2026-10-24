@@ -236,3 +236,43 @@ class DiscountedAverage:
         else:
             self.avg = self.avg * self.gamma + rew
         return self.avg
+
+
+class RunningNormalization(nn.Module):
+    """Running mean/std normalizer; updated from data without gradients, frozen after ``max_count``.
+
+    Adapted from the SuperMimic reference implementation (MIT License, see
+    licenses/dependencies/supermimic_vibed_license.txt).
+    """
+
+    def __init__(self, dim: int, max_count: float = 2e8, eps: float = 1e-2):
+        super().__init__()
+        self.register_buffer("mean", torch.zeros(dim))
+        self.register_buffer("var", torch.ones(dim))
+        self.register_buffer("count", torch.zeros(()))
+        self.max_count, self.eps = max_count, eps
+        self._host_count = 0.0  # host-side mirror of ``count`` (avoids a device sync per update)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+        self._host_count = float(self.count)
+
+    @torch.no_grad()
+    def update(self, x: torch.Tensor):
+        x = x.reshape(-1, x.shape[-1]).float()
+        if self._host_count >= self.max_count:
+            return
+        n = x.shape[0]
+        self._host_count += n
+        m, v = x.mean(0), x.var(0, unbiased=False)
+        tot = self.count + n
+        delta = m - self.mean
+        self.mean += delta * n / tot
+        self.var = (self.var * self.count + v * n + delta**2 * self.count * n / tot) / tot
+        self.count = tot
+
+    def forward(self, x):
+        return (x - self.mean) / torch.sqrt(self.var + self.eps**2)
+
+    def std(self):
+        return torch.sqrt(self.var + self.eps**2)

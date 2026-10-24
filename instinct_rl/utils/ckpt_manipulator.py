@@ -206,3 +206,42 @@ def newStd(
         else:
             new_state_dict[state_dict_key] = source_state_dict[state_dict_key]
     return new_state_dict
+
+
+def supermimic_sidecar(
+    source_state_dict: dict,
+    algo_state_dict: dict,
+    sidecar_path: str,
+):
+    """Convert a run of the former stand-alone SuperMimic trainer into the checkpoint of `SuperMimic`.
+
+    The former trainer wrote the policy as an `OnPolicyRunner` checkpoint (`model_<it>.pt`, which is the source state
+    dict) and the rest of the training state in a sidecar file (`supermimic_state_<it>.pt`). `SuperMimic` keeps all of
+    it in one checkpoint (`SuperMimic.state_dict`), so this function moves the entries of the sidecar to their new
+    keys. The replay storage was never saved.
+    ## Args:
+        sidecar_path: str
+            Path of `supermimic_state_<it>.pt` of the same iteration as the source checkpoint.
+    """
+    print("\033[1;36m Converting the former SuperMimic checkpoint, training state from \033[0m", sidecar_path)
+    sidecar = torch.load(sidecar_path, weights_only=True)
+    assert sidecar["iteration"] == source_state_dict["iter"], "The sidecar is not of the iteration of the checkpoint."
+    renamed_keys = {
+        "wm": "world_model",
+        "opt_wm": "world_model_optimizer",
+        "critic": "critic",
+        "opt_v": "critic_optimizer",
+        "fail_head": "failure_head",
+        "opt_fail": "failure_head_optimizer",
+        "fail_head_start_it": "failure_head_start_iteration",
+        "latent_dec": "latent_decoder",
+    }
+    new_state_dict = dict(source_state_dict)
+    for sidecar_key, key in renamed_keys.items():
+        if key in algo_state_dict:
+            new_state_dict[key] = sidecar[sidecar_key]
+        else:
+            print("key:", sidecar_key, "is not used by the algorithm, ignored.")
+    # the state of the task model has the same entries as the sidecar had at its top level
+    new_state_dict["task_model"] = {key: sidecar[key] for key in algo_state_dict["task_model"]}
+    return new_state_dict

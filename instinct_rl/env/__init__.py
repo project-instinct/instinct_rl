@@ -28,4 +28,5 @@
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
+from .task_model import TaskModel, VisualTaskModel
 from .vec_env import VecEnv

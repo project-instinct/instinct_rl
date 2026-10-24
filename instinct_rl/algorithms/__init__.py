@@ -31,8 +31,10 @@
 from .estimator import EstimatorPPO, EstimatorTPPO
 from .lipschitz import LipschitzPPO
 from .ppo import PPO
+from .supermimic import SuperMimic
 from .tppo import TPPO
 from .vae_distill import VaeDistill
+from .visual_latent import VisualLatentAlgoMixin, VisualSuperMimic
 from .wasabi import WasabiAlgoMixin, WasabiPPO
 
 
@@ -50,7 +52,9 @@ __all__ = [
     "EstimatorPPO",
     "EstimatorTPPO",
     "LipschitzPPO",
+    "SuperMimic",
     "VaeDistill",
+    "VisualSuperMimic",
     "WasabiPPO",
     "WasabiEstimatorPPO",
 ]

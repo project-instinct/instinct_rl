@@ -15,6 +15,7 @@ from .moe_actor_critic import MoEActorCritic
 from .normalizer import (
     EmpiricalDiscountedVariationNormalization,
     EmpiricalNormalization,
+    RunningNormalization,
 )
 from .parallel_layer import ParallelLayer
 from .state_estimator import (
@@ -23,6 +24,7 @@ from .state_estimator import (
     EstimatorMixin,
 )
 from .vae_actor_critic import VaeActorCritic
+from .world_model import FailureHead, FloatingBaseWorldModel, LatentDecoder, ValueHead
 
 
 def build_actor_critic(
@@ -85,3 +87,18 @@ def build_normalizer(
         normalizer = None
 
     return normalizer
+
+
+def build_world_model_module(class_name: str, **kwargs):
+    """Build one network of the world-model training (world model, failure head, value head).
+    - If you want to use a not-supported network for quick test, you may set class_name to a module direction,
+        e.g. `instinct_rl.modules:ValueHead`
+    """
+    if ":" in class_name:
+        module_name, name = class_name.split(":")
+        module = importlib.import_module(module_name)
+        module_class = getattr(module, name)
+    else:
+        module_class = globals()[class_name]  # FloatingBaseWorldModel
+
+    return module_class(**kwargs)

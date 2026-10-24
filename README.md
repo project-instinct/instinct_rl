@@ -96,6 +96,42 @@ Teacher-student distillation framework that extends PPO with teacher network gui
 
 Teacher-student distillation framework that extends TPPO with a VAE student network. Uses a VAE to encode and decode to generate the student's action. It generates additional latent distribution separate from the action distribution, which enables the potential of VAE-distillation combined with PPO.
 
+### SuperMimic
+
+World-model based policy training without PPO (SuperMimic, adapted from the [reference implementation](https://github.com/zita-ch/supermimic_vibed) by Chong Zhang, ETH Zurich, MIT License, see [licenses/dependencies/supermimic_vibed_license.txt](licenses/dependencies/supermimic_vibed_license.txt)). The policy collects transitions from the simulator into a replay storage. A floating-base world model (state dynamics and contacts) and a failure head are fitted on k-step windows. The policy is then trained by back-propagating the discounted return through imagined rollouts of the world model (BPTT), with a critic fitted by GAE on the imagined transitions. `SuperMimic` is the native setting: proprioceptive dynamics only, the policy observes no image.
+
+### Visual SuperMimic
+
+`VisualSuperMimic(VisualLatentAlgoMixin, SuperMimic)` is `SuperMimic` for a policy that also sees an image, structured like `WasabiPPO`: the mixin extends the hooks of `SuperMimic` (storage fields, the transition, the world-model losses, the imagination step, diagnostics and the state dict) through `super()`. The latent `z = E(image)` of the image encoder of the policy is a state of the world model: the dynamics MLP takes `z_t` and predicts its increment, in the same k-step windows, so nothing is rendered in imagination and the actor acts on the imagined latent. `E` is trained by the world model and grounded by the reconstruction of the clean image by a `LatentDecoder`. It needs a `VisualTaskModel`.
+
+### Running SuperMimic
+
+SuperMimic runs on the `OnPolicyRunner` like every other algorithm: `OnPolicyRunner` gives `init_storage` the env and its observation normalizers (algorithms that do not need them ignore them), from which SuperMimic builds its task model and normalizes the imagined observations. Every learning iteration the runner steps the env `num_steps_per_env` times (the update-to-data ratio is `1 / num_steps_per_env` updates per env step) and calls `SuperMimic.update` once, which does nothing until the replay storage holds `warmup_steps` env steps. The checkpoint is the one `alg.state_dict()` of `OnPolicyRunner.save`: the policy keeps the keys of `PPO` (so it is directly playable) and the world model, the critic, the failure head, their optimizers and the state of the task model are added, like the discriminator of `WasabiPPO`. Run with `inference_mode_rollout: False` in the runner config. Losses and statistics (including the held-out diagnostics every `diagnostics_interval` iterations) are logged by the runner as `Loss/...` and `Train/...`.
+
+What the algorithm needs from the task is defined by the env, as observation groups of `obs_format` (like the `amp_policy` / `amp_reference` groups of `WasabiPPO`), and by one differentiable model of the task:
+
+- **The `world_model` observation group** (`world_model_obs_group`, no noise, no history, no normalizer) has the components `root_pos_w`, `root_quat_w`, `root_lin_vel_w`, `root_ang_vel_w`, `joint_pos`, `joint_vel`, `last_action`, `contact`, `context` and the reference command (`command_components`, floats); `VisualSuperMimic` also needs the image of the policy and the clean image. The names are arguments of the algorithm, see the docstring of `SuperMimic`.
+- **`infos["terminal_observations"]`** of `VecEnv.step`: the groups of the state right after the step, before the finished envs are reset. A real termination is `dones & ~infos["time_outs"]`.
+- **`TaskModel`** (`instinct_rl.env`, `VisualTaskModel` for a policy with an image): the observations, rewards and terminations of the task as torch functions of the imagined state. It is built from `task_model_class_name` (`module:Class`) as `Class(env=env, obs_format=obs_format, device=device, **task_model_kwargs)`.
+
+```python
+train_cfg = {
+    "policy": {"class_name": "EncoderActorCritic", ...},
+    "normalizers": {"policy": {"class_name": "EmpiricalNormalization"}},
+    "algorithm": {
+        "class_name": "VisualSuperMimic",
+        "task_model_class_name": "your_package.your_module:YourTaskModel",
+        "task_model_kwargs": {...},
+        "imagination_horizon": 32, "warmup_steps": 64, "action_noise": 0.1, ...
+    },
+    "num_steps_per_env": 2, "inference_mode_rollout": False,
+    "save_interval": 2000, "log_interval": 50,
+}
+runner = OnPolicyRunner(env, train_cfg, log_dir, device)
+```
+
+A run of the former stand-alone SuperMimic trainer (`model_<it>.pt` plus the sidecar `supermimic_state_<it>.pt`) is converted on loading with `ckpt_manipulator="supermimic_sidecar"` and `ckpt_manipulator_kwargs={"sidecar_path": ".../supermimic_state_<it>.pt"}` (`instinct_rl.utils.ckpt_manipulator`).
+
 ---
 
 ## Network modules
