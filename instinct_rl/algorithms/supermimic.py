@@ -65,6 +65,8 @@ class SuperMimic:
         save_replay_in_checkpoint: Include the replay buffers in ``state_dict()``.
     """
 
+    #: Observation group carrying the simulation context.
+    context_group = "sim_context"
     #: Observation group and term name carrying the reference frame index.
     ref_index_group = "ref_index"
     ref_index_key = "ref_index"
@@ -195,6 +197,14 @@ class SuperMimic:
     def init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards=1):
         self.num_envs = int(num_envs)
         self.num_actions = int(num_actions)
+        # The simulation context is carried per transition like state: the dynamics model is
+        # conditioned on it, so a rollout seeded from a replayed frame must use that frame's world.
+        # Derived from ``obs_format`` when the config did not name one, before any spec is built.
+        if self.context_group in obs_format and not self.context_specs:
+            for name, shape in obs_format[self.context_group].items():
+                self.context_specs[name] = TensorSpec((int(np.prod(shape)),))
+            self.context_names = list(self.context_specs)
+
         specs: dict[str, TensorSpec] = {}
         specs.update(self.state_specs)
         specs.update(self.context_specs)
@@ -222,7 +232,7 @@ class SuperMimic:
         if self.world_model is None:
             self.world_model = WorldModel(
                 action_size=self.num_actions,
-                context_size=sum(int(np.prod(s)) for s in self.context_specs.values()),
+                context_size=sum(int(np.prod(spec.shape)) for spec in self.context_specs.values()),
                 **self._world_model_cfg,
             ).to(self.device)
             self.world_model_optimizer = torch.optim.Adam(
@@ -264,9 +274,10 @@ class SuperMimic:
         pack = next_extra_obs if next_extra_obs is not None else {}
         step: dict[str, torch.Tensor] = {}
 
-        # The env ships the world-model state as one concatenated observation group; the layout lives
-        # in the imagination, which slices it into the named components the replay stores.
-        if any(name not in pack for name in self.state_names):
+        # The env ships the world-model state and simulation context as one concatenated tensor per
+        # group; the layouts live in the imagination, which slices them into the named components the
+        # replay stores.
+        if any(name not in pack for name in self.state_names + self.context_names):
             pack = {**pack, **self.imagination.split_obs_pack(pack)}
 
         for name in self.state_names:
@@ -387,16 +398,24 @@ class SuperMimic:
         keys = self.state_names + self.context_names
         total = defaultdict(float)
         for _ in range(self.wm_batches_per_update):
+            # Draw one environment per start. Without ``env_ids`` the sampler returns every
+            # environment for each start, and folding those dimensions makes the world-model batch
+            # ``wm_batch_size * num_envs`` -- a silently different batch on every machine, and at
+            # 4096 envs large enough to exhaust the GPU. The replay holds envs independently, so one
+            # random env per start is a valid sample of the same data.
+            env_sel = torch.randint(
+                0, self.num_envs, (self.wm_batch_size,), generator=self._noise_generator
+            )
             windows, mask = self.replay.sample_windows(
-                self.wm_batch_size, self.wm_horizon + 1, keys + ["action"]
+                self.wm_batch_size, self.wm_horizon + 1, keys + ["action"], env_ids=env_sel
             )
             # the replay lives on the CPU to keep GPU memory for activations
             windows = {k: v.to(self.device) for k, v in windows.items()}
             mask = mask.to(self.device)
-            # (B, L, E, ...) -> treat every env as an independent sample: fold L and E
+
             def flatten(name, offset):
-                t = windows[name][:, offset]  # (B, E, ...)
-                return t.reshape(-1, *t.shape[2:])
+                # ``(B, ...)``: one environment per sample, so the batch axis is already right.
+                return windows[name][:, offset]
 
             # states at t..t+k, actions at t..t+k-1, stacked over the window
             state_seq = torch.cat(
@@ -416,8 +435,14 @@ class SuperMimic:
 
             if not bool(flat_mask.any()):
                 continue
+            # Broadcast the per-window validity to every step: a window that crosses an episode reset
+            # describes a discontinuity, not dynamics, so it must not be fitted on.
             losses = self.world_model.rollout_loss(
-                state_seq[:, 0], action_seq, context, state_seq[:, 1:], mask=None
+                state_seq[:, 0],
+                action_seq,
+                context,
+                state_seq[:, 1:],
+                mask=flat_mask.unsqueeze(-1).expand(-1, self.wm_horizon),
             )
             loss = losses["loss"]
             self.world_model_optimizer.zero_grad(set_to_none=True)
@@ -642,7 +667,11 @@ class SuperMimic:
     def _imagined_return(self, idx: torch.Tensor) -> torch.Tensor:
         """Differentiable H-step return for a batch subset, starting from held states."""
         state_vec = self._imagined_start_state[idx]
-        context_vec = self._imagined_start_context
+        # The context is per sample like the state: a chunk is a subset of the batch, so it must be
+        # subset too or the world model sees someone else's physics.
+        context_vec = (
+            None if self._imagined_start_context is None else self._imagined_start_context[idx]
+        )
         ref_index = self._imagined_start_ref
         if ref_index is not None and hasattr(self.imagination, "select_reference_rows"):
             # This pass works on a batch subset, so the reference rows are selected to match it and the

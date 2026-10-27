@@ -22,8 +22,8 @@ from instinct_rl.utils.returns import compute_gae, normalize_advantages
 DEVICE = "cpu"
 
 
-def _build(critic=True, horizon=8, wm_horizon=4, use_critic=True, num_imagined=64, warmup=0):
-    env = FakeVecEnv(num_envs=16, episode_length=16)
+def _build(critic=True, horizon=8, wm_horizon=4, use_critic=True, num_imagined=64, warmup=0, num_envs=16):
+    env = FakeVecEnv(num_envs=num_envs, episode_length=16)
     actor_critic = ActorCritic(
         obs_format=OBS_FORMAT,
         num_actions=NUM_ACTIONS,
@@ -150,7 +150,15 @@ def test_replay_windows_are_contiguous_and_checkpointable():
         steps += 1
     windows, mask = r.sample_windows(4, 3, ["s", "episode_step"], generator=gen)
     assert windows["s"].shape == (4, 3, 2, 2)
-    assert mask.shape == (4,)
+    # validity is per environment: envs reset independently, so one env's window can straddle a reset
+    # while another's does not
+    assert mask.shape == (4, 2)
+
+    # selecting one env per sample drops the env axis from both the windows and the mask
+    sel = torch.tensor([0, 1, 0, 1])
+    windows_one, mask_one = r.sample_windows(4, 3, ["s", "episode_step"], generator=gen, env_ids=sel)
+    assert windows_one["s"].shape == (4, 3, 2)
+    assert mask_one.shape == (4,)
     # episode_step increments inside a valid window
     assert torch.all(windows["episode_step"][0, 1] - windows["episode_step"][0, 0] == 1)
 
@@ -220,3 +228,41 @@ if __name__ == "__main__":
             fn()
             print(f"[ok ] {name}")
     print("\nall SuperMimic tests passed")
+
+
+def test_world_model_batch_is_independent_of_num_envs():
+    """The world-model fit batch must be ``wm_batch_size``, whatever the environment count.
+
+    The sampler returns ``(B, length, num_envs, ...)`` when asked for every environment, and folding
+    that env axis into the batch silently multiplied the fit batch by ``num_envs``. The same config
+    then trained on different data volumes per machine, and at a few thousand envs the resulting
+    tensors exhausted memory -- which surfaced as the process dying rather than as an error.
+    """
+    recorded = []
+
+    for num_envs in (8, 64):
+        env, algo = _build(num_envs=num_envs, warmup=0)
+        original = algo.world_model.rollout_loss
+
+        def spy(state0, actions, context, target_states, *args, **kwargs):
+            recorded.append((num_envs, state0.shape[0], actions.shape[0], target_states.shape[1]))
+            return original(state0, actions, context, target_states, *args, **kwargs)
+
+        algo.world_model.rollout_loss = spy
+        try:
+            for _ in range(3):
+                obs, extras = env.get_observations()
+                for _ in range(6):
+                    action = algo.act(obs, extras["observations"])
+                    obs, reward, done, infos = env.step(action)
+                    extra_obs = infos["observations"]
+                    algo.process_env_step(reward, done, infos, extra_obs["policy"], extra_obs)
+            algo._fit_world_model()
+        finally:
+            algo.world_model.rollout_loss = original
+
+    assert recorded, "world-model fit never ran"
+    batch_sizes = {batch for _, batch, _, _ in recorded}
+    assert batch_sizes == {32}, f"world-model batch tracked num_envs: {recorded}"
+    # and every batch really carried the configured window length
+    assert all(k == 4 for *_, k in recorded), f"unexpected window length: {recorded}"

@@ -172,34 +172,66 @@ class ReplayStorage:
                         break
         return torch.as_tensor(starts[:batch_size], dtype=torch.long)
 
-    def _gather_window(self, starts: torch.Tensor, length: int, keys: Sequence[str]):
-        """Gather ``(B, length, num_envs, ...)`` windows, plus a per-start validity mask.
+    def _gather_window(
+        self,
+        starts: torch.Tensor,
+        length: int,
+        keys: Sequence[str],
+        env_ids: torch.Tensor | None = None,
+    ):
+        """Gather windows, plus a per-start validity mask.
+
+        Args:
+            starts: ``(B,)`` ring indices of the window starts.
+            length: Window length.
+            keys: Tensors to gather.
+            env_ids: ``(B,)`` environment per start. When given, only that environment is read; when
+                None, every environment is gathered, which costs ``B * length * num_envs`` values and
+                is only appropriate when the caller genuinely wants them all.
 
         Returns:
-            ``(windows, mask)`` where ``mask`` has shape ``(B,)``: False means the window crosses an
-            episode reset, so the caller should drop or down-weight that sample.
+            ``(windows, mask)``: ``windows[k]`` is ``(B, length, num_envs, *spec)`` with the env axis, or
+            ``(B, length, *spec)`` when ``env_ids`` selects one env per start. ``mask`` is
+            ``(B, num_envs)`` or ``(B,)`` correspondingly; False means the window crosses an episode
+            reset, so the caller should drop or down-weight that sample.
         """
         offsets = torch.arange(length)
         idx = (starts.unsqueeze(1) + offsets.unsqueeze(0)) % self.capacity_per_env  # (B, L)
+        # Reading one env per start is what keeps this bounded: with every env the gather is
+        # B * length * num_envs values, which is terabytes at a few thousand envs and is what killed
+        # the process outright rather than raising.
+        pick = None if env_ids is None else torch.as_tensor(env_ids).to(idx.device).view(-1, 1)
         wanted = list(dict.fromkeys(list(keys) + [self.episode_key]))
         out = {}
         for key in wanted:
             if key not in self._buffers:
                 raise KeyError(f"unknown key {key!r}; stored: {sorted(self._buffers)}")
             buf = self._buffers[key]
-            # Advanced indexing on dim 0 keeps the remaining dims: (B, L, num_envs, *spec).
-            gathered = buf[idx]
+            # Advanced indexing on dim 0 keeps the remaining dims: (B, L, num_envs, *spec), or
+            # (B, L, *spec) when one env is picked per start.
+            gathered = buf[idx] if pick is None else buf[idx, pick]
             if self.storage_dtype is not None and gathered.dtype != self.specs[key].dtype:
                 gathered = gathered.to(self.specs[key].dtype)
             out[key] = gathered
 
-        # Validity: episode_step must increment by exactly one across each window. All envs advance in
-        # lockstep, so the first env decides; a reset inside the window breaks contiguity.
+        # Validity: episode_step must increment by exactly one across each window. Environments reset
+        # independently, so a window contiguous for one env may straddle a reset for another.
+        #
+        # Gathered tensors carry an env axis only when every env was read: (B, L, num_envs, *spec).
+        # Reducing spec dims away must never touch that env axis -- consuming it would compare env 0's
+        # step counter against every env's, reporting every window as invalid.
         episode = out[self.episode_key]
-        while episode.dim() > 2:
+        spec_ndim = len(self.specs[self.episode_key].shape)
+        for _ in range(spec_ndim):
             episode = episode[..., 0]
-        expected = episode[:, :1] + offsets.to(episode.device).unsqueeze(0)
-        mask = (episode == expected).all(dim=-1)  # (B,)
+        # ``episode`` is now (B, L) or (B, L, E); the offset grows along the *time* axis.
+        offsets_ = offsets.to(episode.device)
+        if episode.dim() == 3:
+            expected = episode[:, :1] + offsets_.view(1, -1, 1)  # (B, L, E)
+            mask = (episode == expected).all(dim=1)  # (B, E)
+        else:
+            expected = episode[:, :1] + offsets_.view(1, -1)  # (B, L)
+            mask = (episode == expected).all(dim=1)  # (B,)
 
         return {k: out[k] for k in keys}, mask
 
@@ -214,20 +246,28 @@ class ReplayStorage:
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
         """Sample contiguous windows for world-model fitting.
 
+        Args:
+            batch_size: Number of windows to draw.
+            length: Window length in stored steps.
+            keys: Tensors to gather.
+            generator: Optional RNG for reproducibility.
+            env_ids: One environment per sample. When given, the returned tensors drop the env axis
+                and are shaped ``(B, length, *spec)``, with ``mask`` of shape ``(B,)``. When omitted,
+                every environment is returned for each start, shaped
+                ``(B, length, num_envs, *spec)``, with ``mask`` of shape ``(B, num_envs)``.
+
         Returns:
-            ``(batch, mask)``: ``batch[k]`` has shape ``(B, length, num_envs, *spec)`` when ``env_ids`` is
-            None (all envs of the sampled start index), else ``(B, length, *spec)`` for the chosen env;
-            ``mask`` is ``(B, length)``.
+            ``(batch, mask)``.
         """
         starts = self._sample_valid_starts(batch_size, length, generator, require_contiguous=True)
-        windows, mask = self._gather_window(starts, length, keys)
+        env_sel = None
         if env_ids is not None:
-            # (B, L, E, ...) -> pick one env per sample
             env_sel = torch.as_tensor(env_ids) if not torch.is_tensor(env_ids) else env_ids
             if env_sel.numel() == 1:
                 env_sel = env_sel.expand(batch_size)
-            windows = {k: v[torch.arange(batch_size), :, env_sel] for k, v in windows.items()}
-        return windows, mask
+        # The environment selection is pushed into the gather rather than applied afterwards: reading
+        # all envs first is B * length * num_envs values and does not fit.
+        return self._gather_window(starts, length, keys, env_ids=env_sel)
 
     def sample_starts(
         self,
@@ -246,11 +286,14 @@ class ReplayStorage:
         if history < 1:
             raise ValueError("history must be >= 1")
         starts = self._sample_valid_starts(batch_size, history, generator, require_contiguous=False)
-        windows, mask = self._gather_window(starts, history, list(keys) + [self.episode_key])
-        # One env per start: gathered tensors are (B, history, E, *spec).
+        # Pick the environment *before* gathering. Gathering every environment first costs
+        # ``batch_size * history * num_envs`` values, which at a few thousand envs runs to hundreds of
+        # gigabytes and takes the process down silently instead of raising.
         env_sel = torch.randint(0, self.num_envs, (batch_size,), generator=generator)
-        batch_idx = torch.arange(batch_size)
-        out = {k: windows[k][batch_idx, :, env_sel] for k in keys}
+        windows, mask = self._gather_window(
+            starts, history, list(keys) + [self.episode_key], env_ids=env_sel
+        )
+        out = {k: windows[k] for k in keys}
         out["history_mask"] = mask
         # which environment each start came from: callers that need per-env side data (e.g. the
         # reference window) align on this
