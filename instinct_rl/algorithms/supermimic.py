@@ -8,7 +8,8 @@ A critic bootstraps the return past the imagination horizon, which is what makes
 Structure (paper: Liao et al., arXiv 2610.28480, Tables A.1 and A.5):
 
 1. **Collect** ``num_steps_per_env`` steps with the deterministic policy plus Gaussian action noise,
-   storing ``(state, context, action, reward, done, episode_step, ref_index)`` in a
+   storing ``(state, context, action, reward, done, episode_step)`` plus the imagination's seed groups
+   (e.g. which reference each state was tracking) in a
    :class:`~instinct_rl.storage.replay_storage.ReplayStorage`.
 2. **Fit the world model** on ``wm_batches_per_update`` windows of ``wm_horizon`` steps drawn from the
    replay (its own optimiser, gradient clipping and (optionally) gradient accumulation).
@@ -33,7 +34,7 @@ import torch.nn as nn
 
 from instinct_rl.modules.world_model import WorldModel
 from instinct_rl.storage.replay_storage import ReplayStorage, TensorSpec
-from instinct_rl.utils.returns import compute_gae, normalize_advantages
+from instinct_rl.utils.returns import compute_gae
 
 
 class SuperMimic:
@@ -67,9 +68,6 @@ class SuperMimic:
 
     #: Observation group carrying the simulation context.
     context_group = "sim_context"
-    #: Observation group and term name carrying the reference frame index.
-    ref_index_group = "ref_index"
-    ref_index_key = "ref_index"
 
     def __init__(
         self,
@@ -129,9 +127,7 @@ class SuperMimic:
         if state_specs is None:
             # flattened, because ``process_env_step`` stores each component as (num_envs, prod(shape)):
             # the replay holds vectors, not the observation group's per-term shapes.
-            state_specs = {
-                name: TensorSpec((int(np.prod(shape)),)) for name, shape in imagination.state_format.items()
-            }
+            state_specs = {name: TensorSpec((int(np.prod(shape)),)) for name, shape in imagination.state_format.items()}
         self.state_specs = dict(state_specs)
         self.context_specs = dict(context_specs or {})
         self.state_names = list(self.state_specs)
@@ -165,20 +161,20 @@ class SuperMimic:
         # State of the last imagined rollout, held so the policy pass can replay the same
         # trajectories with gradients. Declared here so a chunked update that runs before any
         # imagination fails loudly instead of reading a stale attribute.
-        self._imagined_start_state: torch.Tensor | None = None
-        self._imagined_start_context: torch.Tensor | None = None
-        self._imagined_start_ref: torch.Tensor | None = None
-        self._imagined_start_history: tuple[torch.Tensor | None, torch.Tensor | None] = (None, None)
-        self._imagined_local_ref: torch.Tensor | None = None
-        self._imagined_row_index: torch.Tensor | None = None
+        self._imagined_start: dict | None = None
+        self._imagined_has_reference = False
         self._bounds: tuple[torch.Tensor, torch.Tensor] | None = None
 
         self._world_model_learning_rate = float(world_model_learning_rate)
         self.world_model_optimizer = (
-            None if self.world_model is None
+            None
+            if self.world_model is None
             else torch.optim.Adam(self.world_model.parameters(), lr=self._world_model_learning_rate)
         )
-        self.policy_optimizer = torch.optim.Adam(self.actor_critic.actor.parameters(), lr=policy_learning_rate)
+        # paper Table A.5: Adam with beta = (0.9, 0.95) for the policy
+        self.policy_optimizer = torch.optim.Adam(
+            self.actor_critic.actor.parameters(), lr=policy_learning_rate, betas=(0.9, 0.95)
+        )
         critic_params = list(self.actor_critic.critic.parameters())
         if not critic_params:
             raise ValueError("SuperMimic needs a critic network in the actor_critic (even if use_critic is False)")
@@ -213,12 +209,15 @@ class SuperMimic:
         specs["reward"] = TensorSpec((int(num_rewards),))
         specs["done"] = TensorSpec((1,))
         specs["episode_step"] = TensorSpec((), torch.int64)
-        # ``ref_index`` is not a policy input; it rides along so a rollout seeded from a replayed state
-        # can start from the matching point in the clip.
-        if self.ref_index_group in obs_format:
-            shape = tuple(obs_format[self.ref_index_group][self.ref_index_key])
-            self.extra_replay_specs.setdefault(self.ref_index_key, TensorSpec(shape, torch.float32))
-            specs[self.ref_index_key] = self.extra_replay_specs[self.ref_index_key]
+        # Groups the imagination needs to seed a rollout from a replayed state (e.g. which reference the
+        # state was tracking). Stored per transition under the group name, flattened.
+        self.seed_groups = tuple(getattr(self.imagination, "SEED_GROUPS", ()))
+        for group in self.seed_groups:
+            if group not in obs_format:
+                raise KeyError(f"the imagination needs observation group {group!r} to seed rollouts")
+            size = sum(int(np.prod(shape)) for shape in obs_format[group].values())
+            self.extra_replay_specs[group] = TensorSpec((size,))
+            specs[group] = self.extra_replay_specs[group]
         self.replay = ReplayStorage(
             num_envs=self.num_envs,
             capacity_per_env=self.replay_capacity,
@@ -252,18 +251,21 @@ class SuperMimic:
         self.normalizers = dict(normalizers or {})
 
     def _normalize(self, group: str, obs: torch.Tensor) -> torch.Tensor:
-        """Apply the same normaliser the runner applies to the real observation group."""
+        """Apply the runner's normaliser for this group, without updating its statistics.
+
+        The statistics describe the real observations the deployed policy sees. Calling the normaliser
+        in training mode would also fold every imagined observation into them, so imagined (and possibly
+        off-distribution) data would shift how real observations are scaled.
+        """
         normalizer = getattr(self, "normalizers", {}).get(group)
-        return obs if normalizer is None else normalizer(obs)
+        return obs if normalizer is None else normalizer.normalize(obs)
 
     def act(self, obs, extra_obs):
         """Deterministic action plus exploration noise."""
         with torch.no_grad():
             action = self.actor_critic.act_inference(obs)
             if self.collection_noise_std > 0.0:
-                noise = torch.randn(
-                    action.shape, generator=self._noise_generator, dtype=action.dtype
-                ).to(action.device)
+                noise = torch.randn(action.shape, generator=self._noise_generator, dtype=action.dtype).to(action.device)
                 action = action + self.collection_noise_std * noise
         self._last_action = action.detach()
         self._last_obs_pack = extra_obs
@@ -283,8 +285,11 @@ class SuperMimic:
         for name in self.state_names:
             if name not in pack:
                 raise KeyError(f"imagination state component {name!r} missing from the observation groups")
-            step[name] = pack[name].reshape(self.num_envs, -1).to(self.device).detach() if torch.is_tensor(pack[name]) \
+            step[name] = (
+                pack[name].reshape(self.num_envs, -1).to(self.device).detach()
+                if torch.is_tensor(pack[name])
                 else torch.as_tensor(pack[name], device=self.device)
+            )
         for name in self.context_names:
             if name not in pack:
                 raise KeyError(f"imagination context component {name!r} missing from the observation groups")
@@ -370,11 +375,7 @@ class SuperMimic:
             # divergent rollout must be visible, not absorbed.
             if not getattr(SuperMimic, "_warned_nan", False):
                 step = next(
-                    (
-                        int(t)
-                        for name in bad
-                        for t in (~torch.isfinite(imagined[name])).nonzero()[0][:1]
-                    ),
+                    (int(t) for name in bad for t in (~torch.isfinite(imagined[name])).nonzero()[0][:1]),
                     0,
                 )
                 print(f"[SuperMimic] imagined rollout diverged: non-finite in {bad} (first at index {step})")
@@ -403,9 +404,7 @@ class SuperMimic:
             # ``wm_batch_size * num_envs`` -- a silently different batch on every machine, and at
             # 4096 envs large enough to exhaust the GPU. The replay holds envs independently, so one
             # random env per start is a valid sample of the same data.
-            env_sel = torch.randint(
-                0, self.num_envs, (self.wm_batch_size,), generator=self._noise_generator
-            )
+            env_sel = torch.randint(0, self.num_envs, (self.wm_batch_size,), generator=self._noise_generator)
             windows, mask = self.replay.sample_windows(
                 self.wm_batch_size, self.wm_horizon + 1, keys + ["action"], env_ids=env_sel
             )
@@ -419,8 +418,10 @@ class SuperMimic:
 
             # states at t..t+k, actions at t..t+k-1, stacked over the window
             state_seq = torch.cat(
-                [torch.cat([flatten(n, i) for n in self.state_names], dim=-1).unsqueeze(1)
-                 for i in range(self.wm_horizon + 1)],
+                [
+                    torch.cat([flatten(n, i) for n in self.state_names], dim=-1).unsqueeze(1)
+                    for i in range(self.wm_horizon + 1)
+                ],
                 dim=1,
             )  # (B*E, k+1, state)
             action_seq = torch.cat(
@@ -454,171 +455,181 @@ class SuperMimic:
         return {k: v / max(self.wm_batches_per_update, 1) for k, v in total.items()}
 
     @torch.no_grad()
-    def _sample_imagined_starts(self):
-        """Draw start states, with the history window the policy observation needs, from the replay."""
+    def _sample_imagined_starts(self) -> dict:
+        """Draw start states from the replay, with what the imagination needs to continue from them.
+
+        Returns ``state`` and ``context`` vectors of the newest frame, its ``env_index``, the trailing
+        ``history_state`` / ``history_action`` windows when the policy keeps observation history, and
+        ``seeds``: the newest frame of every seed group the imagination declared.
+        """
         history = max(int(getattr(self.imagination, "history_length", 0)), 1)
         needs_history = bool(getattr(self.imagination, "history_terms", ()))
-        keys = self.state_names + self.context_names
+        keys = self.state_names + self.context_names + list(self.seed_groups)
         if needs_history:
             # The stored action at a row is the action that *produced* that row's state, which is
             # exactly the ``last_action`` observation of that frame.
             keys = keys + ["action"]
         batch = self.replay.sample_starts(self.num_imagined, keys, history=history)
-        batch = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+        batch = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
-        state = {name: batch[name][:, -1] for name in self.state_names}
-        context = {name: batch[name][:, -1] for name in self.context_names}
+        def newest(names):
+            return torch.cat([batch[n][:, -1] for n in names], dim=-1) if names else None
 
-        history_state = history_action = None
+        start = {
+            "state": newest(self.state_names),
+            "context": newest(self.context_names),
+            "env_index": batch["env_index"],
+            "seeds": {g: batch[g][:, -1] for g in self.seed_groups},
+            "history_state": None,
+            "history_action": None,
+        }
         if needs_history:
-            history_state = torch.cat(
-                [batch[name].reshape(self.num_imagined, history, -1) for name in self.state_names], dim=-1
+            start["history_state"] = torch.cat(
+                [batch[n].reshape(self.num_imagined, history, -1) for n in self.state_names], dim=-1
             )
-            history_action = batch["action"].reshape(self.num_imagined, history, -1)
-        return state, context, batch["history_mask"], batch.get("env_index"), history_state, history_action
+            start["history_action"] = batch["action"].reshape(self.num_imagined, history, -1)
+        return start
 
-    def _imagine(self) -> dict[str, torch.Tensor]:
-        """Roll the world model forward under the current policy.
+    def _policy_observation(self, state, context, prev_action, ref_index, history_state, history_action):
+        """Imagined policy input: the noise-free observation, plus sensor noise, then normalised.
 
-        Returns batched tensors with time on dim 0: states, actions, rewards, termination
-        probabilities and the policy-observation history the policy consumed.
+        Paper Sec. 3.3: the model emits the noise-free observation and the sensor noise is re-added
+        before the policy acts. Noise goes on the raw observation, where the environment applies it.
         """
-        state, context, _, env_index, history_state, history_action = self._sample_imagined_starts()
-        self._bounds = self._state_bounds()
-        state_vec = torch.cat([state[name] for name in self.state_names], dim=-1)
-        context_vec = (
-            torch.cat([context[name] for name in self.context_names], dim=-1) if self.context_names else None
+        obs = self.imagination.policy_obs(state, context, prev_action, ref_index, history_state, history_action)
+        return self._normalize("policy", self.imagination.add_obs_noise(obs))
+
+    def _value(self, state, context, ref_index, prev_action) -> torch.Tensor:
+        """Critic value ``(B, 1)``; zero for the paper's critic ablation."""
+        if not self.use_critic:
+            return torch.zeros(state.shape[0], 1, device=self.device)
+        obs = self.imagination.critic_obs(state, context, ref_index, prev_action)
+        return self.actor_critic.evaluate(self._normalize("critic", obs))
+
+    def _rows(self, idx: torch.Tensor):
+        """The held rollout starts restricted to the batch rows ``idx``."""
+        start = self._imagined_start
+        if self._imagined_has_reference:
+            self.imagination.subset_reference_rows(idx)
+
+        def take(t):
+            return None if t is None else t[idx]
+
+        return (
+            start["state"][idx],
+            take(start["context"]),
+            take(start["history_state"]),
+            take(start["history_action"]),
         )
 
-        # The reference snapshot is taken from the environment's *current* clip position and the rollout
-        # starts at column 0 of it. Seeding each rollout from its own replayed frame index would need one
-        # window per sample, which does not fit in memory at the paper's batch sizes; the resulting bias
-        # only affects which clip position a rollout starts at, not its dynamics or reward.
+    def _first_prev_action(self, history_action, batch: int) -> torch.Tensor:
+        """The action that produced the start state: the newest entry of the action window, or the
+        environment's value at reset (zeros) when no history is kept."""
+        if history_action is not None:
+            return history_action[:, -1]
+        return torch.zeros(batch, self.num_actions, device=self.device)
+
+    @torch.no_grad()
+    def _imagine(self) -> dict[str, torch.Tensor]:
+        """Roll the world model forward under the current policy, without gradients.
+
+        This is the data the critic is fit on. The policy gradient is taken in a separate differentiable
+        pass (:meth:`_imagined_return`) from the same held starts.
+
+        Timing follows the environment (and paper Eq. 2): action ``a_t`` is taken in ``s_t``, and the
+        reward ``r_{t+1}`` and termination ``d_{t+1}`` are evaluated on ``s_{t+1}`` against the
+        reference one step later.
+
+        Returns:
+            ``state`` and ``prev_action`` with ``H + 1`` steps (``s_0 .. s_H`` and the action that
+            produced each), ``reward``/``done`` ``(H, B, 1)`` for ``r_1 .. r_H`` / ``d_1 .. d_H``, and
+            ``value`` ``(H + 1, B, 1)`` for ``V(s_0) .. V(s_H)``.
+        """
+        start = self._sample_imagined_starts()
+        self._bounds = self._state_bounds()
+        batch = start["state"].shape[0]
+
         ref_index = None
-        if hasattr(self.imagination, "refresh_reference_window"):
-            self.imagination.refresh_reference_window(self.horizon)
-            # one window row per *environment*; imagined starts are sampled across envs, so select the
-            # row each start belongs to before the rollout indexes it by frame.
-            if env_index is None:
-                raise RuntimeError("imagined starts did not report their env index")
-            self.imagination.select_reference_rows(env_index)
-            # rows of the *selected* window, so a later batch subset can pick its own slice
-            self._imagined_row_index = torch.arange(state_vec.shape[0], device=self.device)
-            ref_index = torch.zeros(state_vec.shape[0], dtype=torch.long, device=self.device)
+        if hasattr(self.imagination, "begin_rollout"):
+            ref_index = self.imagination.begin_rollout(start["seeds"], start["env_index"], self.horizon)
+        self._imagined_start = start
+        self._imagined_has_reference = ref_index is not None
 
         self.world_model.eval()
         self.actor_critic.eval()
 
-        # remembered so the policy step can start from the same held states
-        self._imagined_start_state = state_vec
-        self._imagined_start_context = context_vec
-        self._imagined_start_ref = ref_index
-        self._imagined_start_history = (history_state, history_action)
-        self._imagined_local_ref = (
-            None if ref_index is None else torch.zeros(ref_index.shape[0], dtype=torch.long, device=self.device)
-        )
+        state, context = start["state"], start["context"]
+        history_state, history_action = start["history_state"], start["history_action"]
+        prev_action = self._first_prev_action(history_action, batch)
+        obs = self._policy_observation(state, context, prev_action, ref_index, history_state, history_action)
 
-        # The action that brought the robot to the start frame is the last column of the action window;
-        # the environment's ``prev_action`` at reset (zeros) is the fallback when no history is kept.
-        prev_action = (
-            history_action[:, -1]
-            if history_action is not None
-            else torch.zeros(state_vec.shape[0], self.num_actions, device=self.device)
-        )
-        obs = self._normalize(
-            "policy",
-            self.imagination.policy_obs(
-                state_vec, context_vec, prev_action, ref_index, history_state, history_action
-            ),
-        )
-        obs_hist = []
-        state_hist, action_hist, reward_hist, done_hist, value_hist = [], [], [], [], []
-
+        states, prev_actions, rewards, dones = [state], [prev_action], [], []
         for _ in range(self.horizon):
-            obs_hist.append(obs)
             action = self.actor_critic.act_inference(obs)
-            reward = self.imagination.reward(state_vec, action, prev_action, ref_index)
-            done = self.imagination.termination_prob(state_vec, ref_index)
-            value = (
-                self.actor_critic.evaluate(
-                    self._normalize("critic", self.imagination.critic_obs(state_vec, context_vec, ref_index))
-                )
-                if self.use_critic
-                else torch.zeros(state_vec.shape[0], 1, device=self.device)
-            )
-
-            state_hist.append(state_vec)
-            action_hist.append(action)
-            reward_hist.append(reward)
-            done_hist.append(done)
-            value_hist.append(value)
-
-            with torch.no_grad():
-                next_state_vec = self._clamp_state(
-                    self.world_model(state_vec, action, context_vec), self._bounds
-                )
+            next_state = self._clamp_state(self.world_model(state, action, context), self._bounds)
             ref_index = self.imagination.advance(ref_index)
+            rewards.append(self.imagination.reward(next_state, action, prev_action, ref_index).sum(-1, keepdim=True))
+            dones.append(self.imagination.termination_prob(next_state, ref_index))
             if history_state is not None:
                 history_state, history_action = self.imagination.advance_history(
-                    history_state, history_action, next_state_vec, action
+                    history_state, history_action, next_state, action
                 )
-            obs = self._normalize(
-                "policy",
-                self.imagination.policy_obs(
-                    next_state_vec, context_vec, action, ref_index, history_state, history_action
-                ),
-            )
-            obs = self.imagination.add_obs_noise(obs)
+            obs = self._policy_observation(next_state, context, action, ref_index, history_state, history_action)
+            state, prev_action = next_state, action
+            states.append(state)
+            prev_actions.append(prev_action)
 
-            state_vec = next_state_vec
-            prev_action = action
-
+        values = [
+            self._value(states[t], context, self._ref_at(t, batch), prev_actions[t]) for t in range(self.horizon + 1)
+        ]
         return {
-            "obs": torch.stack(obs_hist),
-            "state": torch.stack(state_hist),
-            "action": torch.stack(action_hist),
-            "reward": torch.stack(reward_hist),
-            "done": torch.stack(done_hist),
-            "value": torch.stack(value_hist),
+            "state": torch.stack(states),
+            "prev_action": torch.stack(prev_actions),
+            "reward": torch.stack(rewards),
+            "done": torch.stack(dones),
+            "value": torch.stack(values),
         }
 
+    def _ref_at(self, t: int, batch: int) -> torch.Tensor | None:
+        """Reference column of imagined step ``t`` for ``batch`` rollouts started at column 0."""
+        if not self._imagined_has_reference:
+            return None
+        return torch.full((batch,), t, dtype=torch.long, device=self.device)
+
     def _fit_critic(self, imagined: dict[str, torch.Tensor]) -> dict[str, float]:
-        """Regress the critic onto lambda-returns of the imagined rollouts."""
+        """Regress the critic onto the lambda-returns of the imagined rollouts (paper Eq. 3).
+
+        The recursion starts from ``R_H = V(s_H)``, the critic's own estimate beyond the horizon, and
+        the targets are computed once per rollout and held fixed while the critic is fit.
+        """
         with torch.no_grad():
-            # ``reward`` is per-term (already weighted); the return is over their sum, which is the
-            # scalar the environment's reward manager also produces.
-            # values are (T, B, 1); the reduced reward is (T, B), so match shapes explicitly
-            returns, _ = compute_gae(
-                imagined["reward"].sum(dim=-1, keepdim=True),
-                imagined["value"],
+            targets, _ = compute_gae(
+                imagined["reward"],
+                imagined["value"][:-1],
                 imagined["done"],
-                torch.zeros_like(imagined["value"][-1]),
+                imagined["value"][-1],
                 self.gamma,
                 self.lam,
             )
-            targets = returns.detach()
 
         self.actor_critic.train()
-        self.world_model.eval()
-        batch = imagined["value"].shape[1]
+        batch = targets.shape[1]
         mini = max(batch // self.critic_mini_batches, 1)
-        total = 0.0
+        total, count = 0.0, 0
         for _ in range(self.critic_epochs):
             perm = torch.randperm(batch, device=self.device)
-            for start in range(0, batch, mini):
-                idx = perm[start : start + mini]
-                # The critic input is rebuilt from the imagined states through the interface, so it
-                # sees the same features the runner's critic group would provide.
-                context_sel = (
-                    self._imagined_start_context[idx] if self._imagined_start_context is not None else None
-                )
-                ref_sel = self._imagined_local_ref[idx] if self._imagined_local_ref is not None else None
+            for begin in range(0, batch, mini):
+                idx = perm[begin : begin + mini]
+                _, context, _, _ = self._rows(idx)
                 pred = torch.stack(
                     [
-                        self.actor_critic.evaluate(
-                            self._normalize("critic", self.imagination.critic_obs(imagined["state"][t][idx], context_sel, ref_sel))
+                        self._value(
+                            imagined["state"][t][idx],
+                            context,
+                            self._ref_at(t, idx.numel()),
+                            imagined["prev_action"][t][idx],
                         )
-                        for t in range(imagined["state"].shape[0])
+                        for t in range(self.horizon)
                     ]
                 )
                 loss = ((pred - targets[:, idx]) ** 2).mean()
@@ -628,30 +639,29 @@ class SuperMimic:
                     nn.utils.clip_grad_norm_(self.actor_critic.critic.parameters(), self.critic_max_grad_norm)
                 self.critic_optimizer.step()
                 total += float(loss.detach())
-        n = self.critic_epochs * max(len(range(0, batch, mini)), 1)
-        return {"critic_loss": total / n}
+                count += 1
+        return {"critic_loss": total / max(count, 1)}
 
     def _fit_policy(self, imagined: dict[str, torch.Tensor]) -> dict[str, float]:
         """Maximise the imagined return, differentiating through the world model.
 
         This is the SuperMimic gradient: the policy sees the consequences of its actions *through* the
         dynamics model, so a single differentiable rollout replaces PPO's importance-ratio surrogate.
-        The started states, context and per-step rewards come from the caller's imagination interface,
-        so the imagined objective is the same one the simulation would produce.
 
-        The pass is chunked over the batch to bound activation memory (the paper's ``H``-step graph is
-        large); each chunk is one optimiser step on the mean return.
+        The pass is chunked over the batch to bound activation memory; each chunk is one optimiser
+        step on its mean return.
         """
         self.actor_critic.train()
-        self.world_model.train()
+        self.world_model.eval()
 
         batch = imagined["value"].shape[1]
         chunk = max(min(batch, self.policy_chunk_size), 1)
         total = 0.0
+        reward_total = 0.0
         steps = 0
-        for start in range(0, batch, chunk):
-            idx = torch.arange(start, min(start + chunk, batch), device=self.device)
-            objective = self._imagined_return(idx)
+        for begin in range(0, batch, chunk):
+            idx = torch.arange(begin, min(begin + chunk, batch), device=self.device)
+            objective, reward_sum = self._imagined_return(idx)
             loss = -objective
             self.policy_optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -661,63 +671,47 @@ class SuperMimic:
                 nn.utils.clip_grad_value_(self.actor_critic.actor.parameters(), self.policy_grad_value_clip)
             self.policy_optimizer.step()
             total += float(objective.detach())
+            reward_total += float(reward_sum)
             steps += 1
-        return {"policy_return": total / max(steps, 1)}
+        # ``policy_return`` includes the critic's bootstrap, so it also moves as the critic learns;
+        # ``imagined_reward`` is the H-step reward part alone, which only the policy changes.
+        return {"policy_return": total / max(steps, 1), "imagined_reward": reward_total / max(steps, 1)}
 
-    def _imagined_return(self, idx: torch.Tensor) -> torch.Tensor:
-        """Differentiable H-step return for a batch subset, starting from held states."""
-        state_vec = self._imagined_start_state[idx]
-        # The context is per sample like the state: a chunk is a subset of the batch, so it must be
-        # subset too or the world model sees someone else's physics.
-        context_vec = (
-            None if self._imagined_start_context is None else self._imagined_start_context[idx]
-        )
-        ref_index = self._imagined_start_ref
-        if ref_index is not None and hasattr(self.imagination, "select_reference_rows"):
-            # This pass works on a batch subset, so the reference rows are selected to match it and the
-            # frame index is rebuilt at the subset's width. Starting from column 0 is exact here: the
-            # window was sampled at the current time for each sample's own environment.
-            self.imagination.subset_reference_rows(idx)
-            ref_index = torch.zeros(idx.numel(), dtype=torch.long, device=self.device)
-        prev_action = (
-            self._imagined_start_history[1][idx][:, -1]
-            if self._imagined_start_history[1] is not None
-            else torch.zeros(state_vec.shape[0], self.num_actions, device=self.device)
-        )
-        history_state, history_action = self._imagined_start_history
-        if history_state is not None:
-            history_state = history_state[idx]
-            history_action = history_action[idx]
-        obs = self._normalize(
-            "policy",
-            self.imagination.policy_obs(
-                state_vec, context_vec, prev_action, ref_index, history_state, history_action
-            ),
-        )
-        total = torch.zeros(state_vec.shape[0], device=self.device)
+    def _imagined_return(self, idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Differentiable imagined objective for the batch rows ``idx`` (paper Eq. 2).
+
+        Returns the objective and, detached, its H-step reward part without the bootstrap.
+
+        ``J = sum_t gamma^t c_t r_{t+1} + gamma^H c_H V(s_H)``, with the soft survival weight
+        ``c_0 = 1``, ``c_{t+1} = c_t (1 - d_{t+1})``, so returns after a likely termination are
+        discounted away while the gradient through ``d`` is kept.
+        """
+        state, context, history_state, history_action = self._rows(idx)
+        batch = state.shape[0]
+        ref_index = self._ref_at(0, batch)
+        prev_action = self._first_prev_action(history_action, batch)
+        obs = self._policy_observation(state, context, prev_action, ref_index, history_state, history_action)
+
+        total = torch.zeros(batch, device=self.device)
+        survival = torch.ones(batch, device=self.device)
+        discount = 1.0
         for _ in range(self.horizon):
             action = self.actor_critic.act_inference(obs)
-            reward = self.imagination.reward(state_vec, action, prev_action, ref_index).sum(dim=-1)
-            total = total + reward
-            state_vec = self._clamp_state(self.world_model(state_vec, action, context_vec), self._bounds)
+            next_state = self._clamp_state(self.world_model(state, action, context), self._bounds)
             ref_index = self.imagination.advance(ref_index)
+            reward = self.imagination.reward(next_state, action, prev_action, ref_index).sum(dim=-1)
+            total = total + discount * survival * reward
+            survival = survival * (1.0 - self.imagination.termination_prob(next_state, ref_index).squeeze(-1))
+            discount *= self.gamma
             if history_state is not None:
                 history_state, history_action = self.imagination.advance_history(
-                    history_state, history_action, state_vec, action
+                    history_state, history_action, next_state, action
                 )
-            obs = self._normalize(
-                "policy",
-                self.imagination.policy_obs(
-                    state_vec, context_vec, action, ref_index, history_state, history_action
-                ),
-            )
-            prev_action = action
-        if self.use_critic:
-            bootstrap = self.actor_critic.evaluate(
-                self._normalize("critic", self.imagination.critic_obs(state_vec, context_vec, ref_index))
-            ).squeeze(-1)
-            total = total + bootstrap
-        return total.mean()
+            obs = self._policy_observation(next_state, context, action, ref_index, history_state, history_action)
+            state, prev_action = next_state, action
+        reward_sum = total.detach().mean()
+        total = total + discount * survival * self._value(state, context, ref_index, prev_action).squeeze(-1)
+        return total.mean(), reward_sum
 
     # ------------------------------------------------------------------ bookkeeping
 

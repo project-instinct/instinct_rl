@@ -25,25 +25,21 @@ STATE_SEGMENTS = OrderedDict(
 CONTEXT_SEGMENTS = OrderedDict({"friction": (1,)})
 OBS_FORMAT = OrderedDict(
     {
-        "policy": (
-            OrderedDict(
-                {
-                    "state_pos": (2,),
-                    "state_vel": (2,),
-                    "joint_pos": (2,),
-                    "friction": (1,),
-                }
-            )
+        "policy": OrderedDict(
+            {
+                "state_pos": (2,),
+                "state_vel": (2,),
+                "joint_pos": (2,),
+                "friction": (1,),
+            }
         ),
-        "critic": (
-            OrderedDict(
-                {
-                    "state_pos": (2,),
-                    "state_vel": (2,),
-                    "joint_pos": (2,),
-                    "friction": (1,),
-                }
-            )
+        "critic": OrderedDict(
+            {
+                "state_pos": (2,),
+                "state_vel": (2,),
+                "joint_pos": (2,),
+                "friction": (1,),
+            }
         ),
     }
 )
@@ -70,8 +66,8 @@ class ToyImagination:
     def add_obs_noise(self, obs):
         return obs
 
-    def critic_obs(self, state, context, ref_index):
-        return self.policy_obs(state, context, None, ref_index)
+    def critic_obs(self, state, context, ref_index, prev_action=None):
+        return self.policy_obs(state, context, prev_action, ref_index)
 
     # -- imagined MDP --------------------------------------------------------
     def reward(self, state, action, prev_action, ref_index):

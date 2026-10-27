@@ -5,7 +5,13 @@ this protocol is how a task contributes that ability: the algorithm only ever to
 below, so it stays independent of the robot, the reward terms and the physics backend.
 
 Implementations live in the task package (InstinctLab side) and are handed to the algorithm through
-``get_algorithm_inputs()``. Everything is plain torch and differentiable where the algorithm needs
+the algorithm config's ``inputs``, which the runner resolves.
+
+Tasks whose rollouts depend on per-transition data beyond state and context (for example which
+reference motion a state was tracking) declare ``SEED_GROUPS``: observation groups the algorithm
+stores with every transition. They also implement ``begin_rollout(seeds, env_index, horizon)``,
+which receives those groups for the sampled start states and returns the initial ``ref_index``, and
+``subset_reference_rows(idx)``, which narrows the rollout's reference to a batch subset. Everything is plain torch and differentiable where the algorithm needs
 gradients (``reward``, ``termination_prob``, ``advance``, ``policy_obs``); ``critic_obs`` is typically
 not differentiated through.
 
@@ -61,9 +67,16 @@ class ImaginationInterface(Protocol):
         """Apply the observation noise the task uses during training."""
 
     def critic_obs(
-        self, state: torch.Tensor, context: torch.Tensor | None, ref_index: torch.Tensor | None
+        self,
+        state: torch.Tensor,
+        context: torch.Tensor | None,
+        ref_index: torch.Tensor | None,
+        prev_action: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Assemble the critic observation (privileged information is allowed here)."""
+        """Assemble the critic observation (privileged information is allowed here).
+
+        ``prev_action`` is the action that produced ``state``, for critics that observe it.
+        """
 
     def reward(
         self,

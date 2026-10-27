@@ -106,7 +106,9 @@ def test_world_model_learns_analytic_dynamics():
     first = None
     for step in range(400):
         state, action, context, nxt = batch()
-        losses = wm.rollout_loss(state.unsqueeze(0) if state.dim() == 1 else state, action.unsqueeze(1), context, nxt.unsqueeze(1))
+        losses = wm.rollout_loss(
+            state.unsqueeze(0) if state.dim() == 1 else state, action.unsqueeze(1), context, nxt.unsqueeze(1)
+        )
         opt.zero_grad()
         losses["loss"].backward()
         opt.step()
@@ -182,8 +184,10 @@ def test_supermimic_runs_and_improves_imagined_return():
             obs = extra_obs["policy"]
             algo.process_env_step(reward, done, infos, obs, extra_obs)
         losses, stats = algo.update(iteration)
-        if "policy_return" in losses:
-            returns.append(losses["policy_return"])
+        if "imagined_reward" in losses:
+            # the reward part only: ``policy_return`` also contains the critic bootstrap, which grows in
+            # magnitude as the critic learns the infinite-horizon return
+            returns.append(losses["imagined_reward"])
 
     assert algo.replay is not None and len(algo.replay) > 0
     assert "world_model_loss" in losses
@@ -211,9 +215,7 @@ def test_supermimic_checkpoint_round_trip():
 
     _, algo2 = _build()
     algo2.load_state_dict(state)
-    assert torch.equal(
-        next(iter(algo.world_model.parameters())), next(iter(algo2.world_model.parameters()))
-    )
+    assert torch.equal(next(iter(algo.world_model.parameters())), next(iter(algo2.world_model.parameters())))
     assert len(algo2.replay) == len(algo.replay)
 
     torch.save(state, "/tmp/instinct_rl_supermimic_test.pt")
