@@ -31,6 +31,7 @@
 from .estimator import EstimatorPPO, EstimatorTPPO
 from .lipschitz import LipschitzPPO
 from .ppo import PPO
+from .supermimic import SuperMimic
 from .tppo import TPPO
 from .vae_distill import VaeDistill
 from .wasabi import WasabiAlgoMixin, WasabiPPO
@@ -46,6 +47,7 @@ class WasabiEstimatorPPO(WasabiAlgoMixin, EstimatorPPO):
 
 __all__ = [
     "PPO",
+    "SuperMimic",
     "TPPO",
     "EstimatorPPO",
     "EstimatorTPPO",

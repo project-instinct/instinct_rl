@@ -46,6 +46,37 @@ from instinct_rl.utils import ckpt_manipulator
 from instinct_rl.utils.utils import get_subobs_size, store_code_state
 
 
+def _resolve_algorithm_inputs(inputs, env, obs_format) -> dict:
+    """Resolve runtime inputs the algorithm's config names.
+
+    Some constructor arguments cannot be written in YAML because they only exist once the simulator is
+    running -- a differentiable view of the task's MDP needs the live scene, and its layout is only
+    known from ``obs_format``. The config therefore names them by dotted path and the runner binds
+    them, the same way ``SceneEntityCfg`` names a scene entity and the managers resolve it.
+
+    Args:
+        inputs: ``{kwarg_name: "module.path:factory"}``, or None.
+        env: The vectorised environment.
+        obs_format: ``{group: {term: shape}}`` for every observation group.
+
+    Returns:
+        ``{kwarg_name: value}``, each value produced by calling the named factory as
+        ``factory(env=env, obs_format=obs_format)``.
+    """
+    if not inputs:
+        return {}
+    resolved = {}
+    for name, spec in inputs.items():
+        if ":" not in spec:
+            raise ValueError(
+                f"algorithm input {name!r} must be 'module.path:factory', got {spec!r}"
+            )
+        module_name, factory_name = spec.split(":", 1)
+        factory = getattr(importlib.import_module(module_name), factory_name)
+        resolved[name] = factory(env=env, obs_format=obs_format)
+    return resolved
+
+
 class OnPolicyRunner:
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
         """
@@ -71,7 +102,12 @@ class OnPolicyRunner:
 
         alg_class_name = self.alg_cfg.pop("class_name")
         alg_class = importlib.import_module() if ":" in alg_class_name else getattr(algorithms, alg_class_name)
-        self.alg: algorithms.PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
+        self.alg: algorithms.PPO = alg_class(
+            actor_critic,
+            device=self.device,
+            **_resolve_algorithm_inputs(self.alg_cfg.pop("inputs", None), env, obs_format),
+            **self.alg_cfg,
+        )
 
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
@@ -87,6 +123,11 @@ class OnPolicyRunner:
             )
             normalizer.to(self.device)
             self.normalizers[obs_group_name] = normalizer
+
+        # hand the normalisers to the algorithm: a model-based learner builds imagined observations
+        # itself, and they must be scaled exactly like the real ones
+        if hasattr(self.alg, "set_normalizers"):
+            self.alg.set_normalizers(self.normalizers)
 
         # init storage and model
         self.alg.init_storage(
@@ -240,6 +281,11 @@ class OnPolicyRunner:
     """
 
     def log(self, locs, width=80, pad=35):
+        # Algorithms may report plain Python numbers rather than tensors (SuperMimic accumulates
+        # floats); normalise once here so the formatting and writer paths can assume tensors.
+        locs["losses"] = {k: torch.as_tensor(v) for k, v in locs["losses"].items()}
+        locs["stats"] = {k: torch.as_tensor(v) for k, v in locs["stats"].items()}
+
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
         self.tot_time = time.time() - locs["tot_start_time"]
         iteration_time = locs["collection_time"] + locs["learn_time"]
@@ -302,7 +348,9 @@ class OnPolicyRunner:
                         self.current_learning_iteration,
                     )
                     ep_string += f"""{f'Mean step {key}:':>{pad}} {value:.4f}\n"""
-        mean_std = self.alg.actor_critic.action_std.mean()
+        # deterministic-policy algorithms (SuperMimic) have no action standard deviation to log
+        action_std = getattr(self.alg.actor_critic, "action_std", None)
+        mean_std = None if action_std is None else action_std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
         if dist.is_initialized():
             fps *= dist.get_world_size()
@@ -320,7 +368,8 @@ class OnPolicyRunner:
             self.writer_mp_add_scalar("Train/" + k, v.item(), self.current_learning_iteration)
 
         self.writer_mp_add_scalar("Loss/learning_rate", self.alg.learning_rate, self.current_learning_iteration)
-        self.writer_mp_add_scalar("Policy/mean_noise_std", mean_std.item(), self.current_learning_iteration)
+        if mean_std is not None:
+            self.writer_mp_add_scalar("Policy/mean_noise_std", mean_std.item(), self.current_learning_iteration)
         self.writer_mp_add_scalar("Perf/total_fps", fps, self.current_learning_iteration)
         self.writer_mp_add_scalar("Perf/collection_time", locs["collection_time"], self.current_learning_iteration)
         self.writer_mp_add_scalar("Perf/learning_time", locs["learn_time"], self.current_learning_iteration)
@@ -384,8 +433,8 @@ class OnPolicyRunner:
             for k, v in locs["losses"].items():
                 log_string += f"""{k:>{pad}} {v.item():.4f}\n"""
             log_string += (
-                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
-                f"""{'Mean reward:':>{pad}} {statistics.mean([statistics.mean(buf) for buf in locs['rewbuffer']]):.2f}\n"""
+                (f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n""" if mean_std is not None else "")
+                + f"""{'Mean reward:':>{pad}} {statistics.mean([statistics.mean(buf) for buf in locs['rewbuffer']]):.2f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
                 # f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
                 # f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n"""
@@ -402,7 +451,7 @@ class OnPolicyRunner:
             log_string += (
                 f"""{'Value function loss:':>{pad}} {locs["losses"]['value_loss']:.4f}\n"""
                 f"""{'Surrogate loss:':>{pad}} {locs["losses"]['surrogate_loss']:.4f}\n"""
-                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+                + (f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n""" if mean_std is not None else "")
                 # f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
                 # f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n"""
             )
@@ -526,6 +575,8 @@ class OnPolicyRunner:
         ## Return:
             The summarized value across all processes.
         """
+        # algorithms may report plain Python numbers (SuperMimic accumulates floats); normalise first
+        values = torch.as_tensor(values, device=self.device, dtype=torch.float32)
         if remove_nan:
             values = values[~values.isnan()]
         values = values.to(self.device)  # make sure the values are on the all_reduc-able device
