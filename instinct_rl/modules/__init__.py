@@ -23,7 +23,7 @@ from .state_estimator import (
     EstimatorMixin,
 )
 from .vae_actor_critic import VaeActorCritic
-from .world_model import WorldModel
+from .world_model import SegmentDeltaParameterization, StateParameterization, WorldModel
 
 
 def build_actor_critic(

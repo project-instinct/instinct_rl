@@ -89,6 +89,9 @@ class ReplayStorage:
         # ring cursor: index of the newest step; number of steps written so far
         self._cursor = 0
         self._filled = 0
+        # Per-row (min, max) over the envs, for the keys ``observed_range`` has been asked about. Kept up
+        # to date on every ``add`` so the range costs ``capacity`` rows, not a copy of the whole buffer.
+        self._row_range: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
     # ------------------------------------------------------------------ writing
 
@@ -105,6 +108,10 @@ class ReplayStorage:
             if value.shape[0] != self.num_envs:
                 raise ValueError(f"{name!r}: expected {self.num_envs} envs on dim 0, got {value.shape[0]}")
             buffer[self._cursor].copy_(value.to(dtype=buffer.dtype, device=buffer.device))
+            if name in self._row_range:
+                row_min, row_max = self._row_range[name]
+                row_min[self._cursor].copy_(buffer[self._cursor].amin(dim=0))
+                row_max[self._cursor].copy_(buffer[self._cursor].amax(dim=0))
 
         self._cursor = (self._cursor + 1) % self.capacity_per_env
         self._filled = min(self._filled + 1, self.capacity_per_env)
@@ -133,44 +140,35 @@ class ReplayStorage:
         if self._filled < length:
             raise RuntimeError(f"replay holds {self._filled} steps, cannot sample windows of length {length}")
 
-        episode = self._buffers[self.episode_key]
-        # ring position of the oldest valid start so that start + length - 1 is already written
-        newest = (self._cursor - 1) % self.capacity_per_env
-        starts = []
-        attempts = 0
-        max_attempts = 20 * batch_size
-        while len(starts) < batch_size:
-            attempts += 1
-            if attempts > max_attempts:
-                raise RuntimeError(
-                    "could not find enough valid window starts; the replay may be too fragmented by episode "
-                    "resets for the requested window length"
-                )
-            # Draw from the written region only. Sampling the whole ring wastes nearly every candidate
-            # while the buffer is still filling, which used to yield empty batches (and NaN losses).
-            lowest = (self._cursor - self._filled) % self.capacity_per_env
-            span = max(self._filled - length + 1, 1)
-            cand = (lowest + torch.randint(0, span, (max(batch_size, 64),), generator=generator)) % self.capacity_per_env
-            for c in cand.tolist():
-                ok = True
-                for offset in range(length):
-                    idx = (c + offset) % self.capacity_per_env
-                    # the slot must be written at least once and not overwritten by a newer lap
-                    age = (self._cursor - 1 - idx) % self.capacity_per_env
-                    if age >= self._filled:
-                        ok = False
-                        break
-                    if require_contiguous and offset > 0:
-                        prev_idx = (c + offset - 1) % self.capacity_per_env
-                        # episode_step must increment by exactly one inside a window
-                        if int(episode[idx].max()) != int(episode[prev_idx].max()) + 1:
-                            ok = False
-                            break
-                if ok:
-                    starts.append(c)
-                    if len(starts) >= batch_size:
-                        break
-        return torch.as_tensor(starts[:batch_size], dtype=torch.long)
+        # Draw from the written region only: a start ``age`` steps after the oldest written row keeps the
+        # whole window written as long as ``age + length - 1 < filled``. Sampling the whole ring would waste
+        # nearly every candidate while the buffer is still filling.
+        lowest = self._cursor - self._filled
+        span = self._filled - length + 1
+        offsets = torch.arange(length)
+        if require_contiguous:
+            # Without a per-sample environment the window is checked on the row-wise maximum of the step
+            # counter over environments; per-environment validity is the returned mask.
+            episode = self._buffers[self.episode_key].reshape(self.capacity_per_env, self.num_envs, -1)[..., 0]
+            row_max = episode.amax(dim=1).cpu()
+        starts, have = [], 0
+        for _ in range(20):
+            cand = (
+                lowest + torch.randint(0, span, (max(2 * batch_size, 64),), generator=generator)
+            ) % self.capacity_per_env
+            if require_contiguous:
+                seq = row_max[(cand.unsqueeze(1) + offsets.unsqueeze(0)) % self.capacity_per_env]  # (C, L)
+                cand = cand[(seq == seq[:, :1] + offsets.unsqueeze(0)).all(dim=1)]
+            starts.append(cand)
+            have += cand.numel()
+            if have >= batch_size:
+                break
+        if have < batch_size:
+            raise RuntimeError(
+                "could not find enough valid window starts; the replay may be too fragmented by episode "
+                "resets for the requested window length"
+            )
+        return torch.cat(starts)[:batch_size].long()
 
     def _gather_window(
         self,
@@ -235,7 +233,6 @@ class ReplayStorage:
 
         return {k: out[k] for k in keys}, mask
 
-
     def sample_windows(
         self,
         batch_size: int,
@@ -259,7 +256,9 @@ class ReplayStorage:
         Returns:
             ``(batch, mask)``.
         """
-        starts = self._sample_valid_starts(batch_size, length, generator, require_contiguous=True)
+        # With one environment per sample the returned per-sample ``mask`` (or the caller's own step
+        # counter check) decides validity, so starts need only lie in the written region.
+        starts = self._sample_valid_starts(batch_size, length, generator, require_contiguous=env_ids is None)
         env_sel = None
         if env_ids is not None:
             env_sel = torch.as_tensor(env_ids) if not torch.is_tensor(env_ids) else env_ids
@@ -290,9 +289,7 @@ class ReplayStorage:
         # ``batch_size * history * num_envs`` values, which at a few thousand envs runs to hundreds of
         # gigabytes and takes the process down silently instead of raising.
         env_sel = torch.randint(0, self.num_envs, (batch_size,), generator=generator)
-        windows, mask = self._gather_window(
-            starts, history, list(keys) + [self.episode_key], env_ids=env_sel
-        )
+        windows, mask = self._gather_window(starts, history, list(keys) + [self.episode_key], env_ids=env_sel)
         out = {k: windows[k] for k in keys}
         out["history_mask"] = mask
         # which environment each start came from: callers that need per-env side data (e.g. the
@@ -318,13 +315,15 @@ class ReplayStorage:
         if filled == 0:
             raise RuntimeError("cannot compute an observed range from an empty replay")
         out = {}
+        # ring positions of the written steps
+        idx = (self._cursor - filled + torch.arange(filled)) % self.capacity_per_env
         for key in keys:
-            buf = self._buffers[key]
-            # ring positions of the written steps
-            idx = (self._cursor - filled + torch.arange(filled)) % self.capacity_per_env
-            window = buf[idx.to(buf.device)]  # (filled, num_envs, *spec)
-            dims = tuple(range(window.dim() - (buf.dim() - 2)))
-            out[key] = (window.amin(dim=dims), window.amax(dim=dims))
+            if key not in self._row_range:
+                buf = self._buffers[key]
+                self._row_range[key] = (buf.amin(dim=1), buf.amax(dim=1))  # (capacity, *spec)
+            row_min, row_max = self._row_range[key]
+            rows = idx.to(row_min.device)
+            out[key] = (row_min[rows].amin(dim=0), row_max[rows].amax(dim=0))
         return out
 
     # ------------------------------------------------------------------ checkpointing
@@ -353,14 +352,18 @@ class ReplayStorage:
         for name, buffer in self._buffers.items():
             saved = state[f"buffer/{name}"]
             if saved.shape != buffer.shape:
-                raise ValueError(f"replay buffer {name!r} shape mismatch: {tuple(saved.shape)} vs {tuple(buffer.shape)}")
+                raise ValueError(
+                    f"replay buffer {name!r} shape mismatch: {tuple(saved.shape)} vs {tuple(buffer.shape)}"
+                )
             buffer.copy_(saved.to(dtype=buffer.dtype, device=buffer.device))
         self._cursor = int(state["cursor"])
         self._filled = int(state["filled"])
+        self._row_range.clear()
 
     def to(self, device: str | torch.device) -> "ReplayStorage":
         for name in self._buffers:
             self._buffers[name] = self._buffers[name].to(device)
+        self._row_range.clear()
         self.device = torch.device(device)
         return self
 

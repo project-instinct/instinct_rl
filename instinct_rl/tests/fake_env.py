@@ -171,8 +171,11 @@ class FakeVecEnv:
         time_out = self.episode_length_buf >= self.max_episode_length
         done = done | time_out
 
-        self.state = next_state
+        self.state = next_state.clone()
+        final_observations = None
         if bool(done.any()):
+            # like IsaacLab's ``compute_final_obs``: the observations the finished episodes ended in
+            final_observations = {k: v.clone() for k, v in self._obs_pack().items()}
             ids = done.nonzero(as_tuple=False).squeeze(-1)
             new_state, new_context = self.world.sample(len(ids), generator=self.generator)
             self.state[ids] = new_state.to(self.device)
@@ -180,6 +183,8 @@ class FakeVecEnv:
             self.episode_length_buf[ids] = 0
 
         infos = {"observations": self._obs_pack(), "time_outs": time_out.to(self.device)}
+        if final_observations is not None:
+            infos["final_observations"] = final_observations
         return (
             self.imagination.policy_obs(self.state, self.context, None, None),
             reward,

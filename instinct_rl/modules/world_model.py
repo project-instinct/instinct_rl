@@ -18,6 +18,11 @@ Three conventions make it reusable across tasks:
   directions, joint angles) is what lets one model serve every initial heading.
 * **Delta vs absolute.** Components listed in ``predict_delta`` are regressed as a delta w.r.t.
   the current state, the rest as absolute values, so a mixed layout needs no special-casing.
+* **Parameterization.** What the network reads and what it predicts are delegated to a
+  :class:`StateParameterization`. The default (:class:`SegmentDeltaParameterization`) feeds the raw
+  state and predicts per-component deltas; a task can supply one that reads heading- and
+  position-invariant features and predicts frame-local increments, which is what lets one model
+  serve every position and heading without having to learn that the dynamics ignore them.
 
 Normalisation lives inside the module, so the loss scale does not depend on the physical units
 of the state, and saving the model saves its statistics with it.
@@ -67,6 +72,89 @@ def _apply_normalizer(normalizer, x: torch.Tensor, update: bool) -> torch.Tensor
         normalizer.train(was_training)
 
 
+class StateParameterization:
+    """How a world model reads a state and expresses one step of change.
+
+    The network maps ``features(s_t)`` (plus action and context) to a target ``y`` of size
+    ``target_size``; ``integrate(s_t, y)`` turns it into ``s_{t+1}``. ``targets(s_t, s_{t+1})`` is the
+    inverse used to build regression targets and their normaliser, and ``error(s_hat, s)`` measures a
+    predicted state against the true one in the target layout (so the error can be scaled by the
+    target's spread). All methods take flat states with arbitrary leading dimensions and must be
+    differentiable.
+
+    Attributes:
+        feature_size: Size of :meth:`features`.
+        target_size: Size of :meth:`targets`, :meth:`integrate`'s input and :meth:`error`.
+        target_segments: ``{name: size}`` blocks of the target layout, for per-component diagnostics.
+    """
+
+    feature_size: int
+    target_size: int
+    target_segments: "OrderedDict[str, int]"
+
+    def features(self, state: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def targets(self, state: torch.Tensor, next_state: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def integrate(self, state: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def error(self, predicted: torch.Tensor, actual: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+
+class SegmentDeltaParameterization(StateParameterization):
+    """The raw state as features; per-component delta (or absolute) targets.
+
+    Components ending in ``quat_w`` hold unit quaternions. Regressed as four free numbers their norm
+    drifts (measured: 1.0 -> 0.1 after ~10 open-loop steps) and every consumer that inverts a rotation
+    -- ``quat_inv`` divides by |q|^2 -- then amplifies the error, so :meth:`integrate` projects each one
+    back onto the unit sphere.
+    """
+
+    def __init__(self, state_segments, predict_delta: set[str]):
+        self.state_segments = state_segments
+        self.predict_delta = set(predict_delta)
+        self.feature_size = self.target_size = int(sum(int(np.prod(s)) for s in state_segments.values()))
+        self.target_segments = OrderedDict((n, int(np.prod(s))) for n, s in state_segments.items())
+        self._quaternion_components = [name for name in state_segments if name.endswith("quat_w")]
+
+    def _slices(self):
+        offset = 0
+        for name, shape in self.state_segments.items():
+            size = int(np.prod(shape))
+            yield name, slice(offset, offset + size)
+            offset += size
+
+    def features(self, state):
+        return state
+
+    def targets(self, state, next_state):
+        return torch.cat(
+            [
+                next_state[..., sl] - state[..., sl] if n in self.predict_delta else next_state[..., sl]
+                for n, sl in self._slices()
+            ],
+            dim=-1,
+        )
+
+    def integrate(self, state, target):
+        chunks = []
+        for name, sl in self._slices():
+            chunk = state[..., sl] + target[..., sl] if name in self.predict_delta else target[..., sl]
+            if name in self._quaternion_components:
+                # a component may hold several quaternions ``(num_links, 4)``; each is normalised alone
+                quats = chunk.reshape(*chunk.shape[:-1], -1, 4)
+                chunk = (quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-6)).reshape(chunk.shape)
+            chunks.append(chunk)
+        return torch.cat(chunks, dim=-1)
+
+    def error(self, predicted, actual):
+        return predicted - actual
+
+
 class WorldModel(nn.Module):
     """MLP dynamics model over flattened (state, action, context) tuples.
 
@@ -86,6 +174,8 @@ class WorldModel(nn.Module):
         normalizer_kwargs: Extra kwargs for the normaliser constructor.
         matmul_dtype: Optional dtype for the MLP matmuls (e.g. ``"bfloat16"``); inputs and
             outputs are cast back to float32. ``None`` keeps the module dtype.
+        parameterization: A :class:`StateParameterization` deciding what the network reads and
+            predicts. ``None`` uses :class:`SegmentDeltaParameterization` with ``predict_delta``.
     """
 
     def __init__(
@@ -100,17 +190,13 @@ class WorldModel(nn.Module):
         use_normalizer: bool = True,
         normalizer_kwargs: dict | None = None,
         matmul_dtype: str | None = None,
+        parameterization: StateParameterization | None = None,
     ):
         super().__init__()
         self.state_segments: "OrderedDict[str, tuple]" = _as_segments(state_segments)
         self.state_size = int(sum(int(np.prod(s)) for s in self.state_segments.values()))
         if self.state_size <= 0:
             raise ValueError("state_segments describe an empty state")
-        # Any component ending in ``quat_w`` holds unit quaternions. The network regresses them as four
-        # free numbers, so their norm drifts (measured: 1.0 -> 0.1 after ~10 open-loop steps) and every
-        # consumer that inverts a rotation -- ``quat_inv`` divides by |q|^2 -- then amplifies the error.
-        # Renormalising after every prediction keeps the rollout on the unit sphere.
-        self._quaternion_components = [name for name in self.state_segments if name.endswith("quat_w")]
         self.action_size = int(action_size)
         if self.action_size <= 0:
             raise ValueError("action_size must be positive")
@@ -145,18 +231,25 @@ class WorldModel(nn.Module):
         if self.matmul_dtype is not None and not self.matmul_dtype.is_floating_point:
             raise ValueError(f"matmul_dtype must be a floating dtype, got {self.matmul_dtype}")
 
-        input_size = self.state_size + self.action_size + self.context_size
+        self.parameterization = (
+            SegmentDeltaParameterization(self.state_segments, self.predict_delta)
+            if parameterization is None
+            else parameterization
+        )
+        target_size = int(self.parameterization.target_size)
+
+        input_size = int(self.parameterization.feature_size) + self.action_size + self.context_size
         self.net = MlpModel(
             input_size=input_size,
             hidden_sizes=list(hidden_sizes),
-            output_size=self.state_size,
+            output_size=target_size,
             nonlinearity=nonlinearity,
         )
 
         if use_normalizer:
             normalizer_kwargs = dict(normalizer_kwargs or {})
             self.input_normalizer = EmpiricalNormalization(shape=[input_size], **normalizer_kwargs)
-            self.output_normalizer = EmpiricalNormalization(shape=[self.state_size], **normalizer_kwargs)
+            self.output_normalizer = EmpiricalNormalization(shape=[target_size], **normalizer_kwargs)
         else:
             self.input_normalizer = None
             self.output_normalizer = None
@@ -164,9 +257,10 @@ class WorldModel(nn.Module):
     # ------------------------------------------------------------------ helpers
 
     def _concat(self, state: torch.Tensor, action: torch.Tensor, context: torch.Tensor | None) -> torch.Tensor:
+        """Network input: the parameterization's features of ``state``, the action and the context."""
         leading = state.shape[:-1]
         parts = [
-            state.reshape(*leading, self.state_size),
+            self.parameterization.features(state.reshape(*leading, self.state_size)),
             action.reshape(*leading, self.action_size),
         ]
         if self.context_size:
@@ -176,51 +270,6 @@ class WorldModel(nn.Module):
         elif context is not None:
             raise ValueError("a context tensor was given but context_size == 0")
         return torch.cat(parts, dim=-1)
-
-    def _segment_slices(self):
-        offset = 0
-        for name, shape in self.state_segments.items():
-            size = int(np.prod(shape))
-            yield name, slice(offset, offset + size)
-            offset += size
-
-    def _renormalize_quaternions(self, state: torch.Tensor) -> torch.Tensor:
-        """Project every quaternion back onto the unit sphere.
-
-        A component may hold several quaternions (``(num_links, 4)``); each is normalised on its own.
-        Normalising the flattened component as one vector would scale ``n`` unit quaternions to norm
-        ``1 / sqrt(n)`` each.
-        """
-        if not self._quaternion_components:
-            return state
-        chunks = []
-        for name, sl in self._segment_slices():
-            chunk = state[..., sl]
-            if name in self._quaternion_components:
-                quats = chunk.reshape(*chunk.shape[:-1], -1, 4)
-                chunk = (quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-6)).reshape(chunk.shape)
-            chunks.append(chunk)
-        return torch.cat(chunks, dim=-1)
-
-    def _split_target(self, state: torch.Tensor, next_state: torch.Tensor) -> torch.Tensor:
-        """Regression target: delta where requested, absolute value otherwise."""
-        chunks = []
-        for name, sl in self._segment_slices():
-            if name in self.predict_delta:
-                chunks.append(next_state[..., sl] - state[..., sl])
-            else:
-                chunks.append(next_state[..., sl])
-        return torch.cat(chunks, dim=-1)
-
-    def _assemble_next(self, state: torch.Tensor, prediction: torch.Tensor) -> torch.Tensor:
-        """Inverse of :meth:`_split_target`."""
-        chunks = []
-        for name, sl in self._segment_slices():
-            if name in self.predict_delta:
-                chunks.append(state[..., sl] + prediction[..., sl])
-            else:
-                chunks.append(prediction[..., sl])
-        return torch.cat(chunks, dim=-1)
 
     def _update_normalizers(self, state0, actions, context, targets, mask) -> None:
         """Update both normalisers from the *logged* transitions of a window.
@@ -243,7 +292,7 @@ class WorldModel(nn.Module):
         step_context = None if context is None else context.unsqueeze(1).expand(-1, steps, -1)
         with torch.no_grad():
             self.input_normalizer.update(self._concat(logged_inputs, actions, step_context)[valid])
-            self.output_normalizer.update(self._split_target(logged_inputs, targets)[valid])
+            self.output_normalizer.update(self.parameterization.targets(logged_inputs, targets)[valid])
 
     def _error_scale(self) -> torch.Tensor | float:
         """Per-dimension scale of the fitting error: the spread of the one-step regression target.
@@ -264,7 +313,7 @@ class WorldModel(nn.Module):
         context: torch.Tensor | None = None,
         update_normalizer: bool = False,
     ) -> torch.Tensor:
-        """Predict the next state (absolute values, world layout). Leading dims are preserved."""
+        """Predict the next state (in the state layout). Leading dims are preserved."""
         x = self._concat(state, action, context)
         x = _apply_normalizer(self.input_normalizer, x, update=update_normalizer)
         if self.matmul_dtype is not None:
@@ -274,8 +323,7 @@ class WorldModel(nn.Module):
             prediction = prediction.float()
         if self.output_normalizer is not None:
             prediction = self.output_normalizer.inverse(prediction)
-        next_state = self._assemble_next(state.reshape(*state.shape[:-1], self.state_size), prediction)
-        return self._renormalize_quaternions(next_state)
+        return self.parameterization.integrate(state.reshape(*state.shape[:-1], self.state_size), prediction)
 
     def rollout(
         self,
@@ -349,10 +397,10 @@ class WorldModel(nn.Module):
             predictions.append(state)
         predictions = torch.stack(predictions, dim=1)  # (B, k, state_size)
 
-        # Errors are measured in units of each dimension's typical one-step change, so a joint angle
-        # and a link velocity count alike; in raw units the loss is dominated by the largest-valued
-        # components (here a ~70x spread in scale).
-        sq_err = ((predictions - targets) / self._error_scale()) ** 2  # (B, k, state_size)
+        # Errors are measured in the target layout, in units of each dimension's typical one-step change,
+        # so a joint angle and a link velocity count alike; in raw units the loss is dominated by the
+        # largest-valued components (here a ~70x spread in scale).
+        sq_err = (self.parameterization.error(predictions, targets) / self._error_scale()) ** 2  # (B, k, T)
 
         if mask is None:
             per_step = sq_err.mean(dim=-1)  # (B, k)
@@ -366,7 +414,10 @@ class WorldModel(nn.Module):
             losses["loss"] = per_step.mean()
         else:
             losses["loss"] = (per_step * weight).sum() / weight.sum().clamp_min(1.0)
-        for name, sl in self._segment_slices():
+        offset = 0
+        for name, size in self.parameterization.target_segments.items():
+            sl = slice(offset, offset + int(size))
+            offset += int(size)
             comp = sq_err[..., sl].mean(dim=-1)  # (B, k)
             if weight is None:
                 losses[f"loss_{name}"] = comp.mean()
@@ -377,5 +428,5 @@ class WorldModel(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"state_size={self.state_size}, action_size={self.action_size}, context_size={self.context_size}, "
-            f"delta_components={sorted(self.predict_delta)}"
+            f"delta_components={sorted(self.predict_delta)}, parameterization={type(self.parameterization).__name__}"
         )

@@ -64,6 +64,12 @@ class SuperMimic:
             clip (the paper uses 0.1).
         learning_rate: Kept for the runner's logger; the effective rates live in the learners.
         save_replay_in_checkpoint: Include the replay buffers in ``state_dict()``.
+        fit_terminal_transitions: Also fit the world model on the step that ends an episode. The env
+            resets a finished episode inside ``step``, so the state it returns belongs to the next
+            episode; the state the episode actually ended in must come from
+            ``infos[final_observation_key]`` (IsaacLab's ``compute_final_obs``). Without it the model
+            never sees a fall and imagines the robot surviving far more often than it does.
+        final_observation_key: Key of the pre-reset observation groups in the step ``infos``.
     """
 
     #: Observation group carrying the simulation context.
@@ -103,6 +109,8 @@ class SuperMimic:
         critic_max_grad_norm: float = 1.0,
         learning_rate: float | None = None,
         save_replay_in_checkpoint: bool = True,
+        fit_terminal_transitions: bool = True,
+        final_observation_key: str = "final_observations",
         device: str | torch.device = "cpu",
         **kwargs,
     ):
@@ -120,6 +128,13 @@ class SuperMimic:
             state_segments=imagination.state_format,
             hidden_sizes=world_model_hidden_sizes,
             predict_delta=world_model_predict_delta,
+            # The task knows its state's geometry; when it supplies a parameterization (e.g. heading-
+            # invariant features and frame-local increments) the model uses it instead of raw deltas.
+            parameterization=(
+                imagination.world_model_parameterization()
+                if hasattr(imagination, "world_model_parameterization")
+                else None
+            ),
         )
 
         # The imagination owns the layout (it is built from the env's own observation groups), so when
@@ -150,6 +165,8 @@ class SuperMimic:
         self.policy_grad_value_clip = policy_grad_value_clip
         self.policy_chunk_size = int(policy_chunk_size)
         self.save_replay_in_checkpoint = bool(save_replay_in_checkpoint)
+        self.fit_terminal_transitions = bool(fit_terminal_transitions)
+        self.final_observation_key = str(final_observation_key)
         # The runner logs `alg.learning_rate`; report the policy rate as the headline number.
         self.learning_rate = float(policy_learning_rate if learning_rate is None else learning_rate)
 
@@ -209,6 +226,10 @@ class SuperMimic:
 
         specs: dict[str, TensorSpec] = {}
         specs.update(self.state_specs)
+        if self.fit_terminal_transitions:
+            # the state each step *reached*: equal to the stored state except where the step ended an
+            # episode, where the stored state is already the next episode's first frame
+            specs.update({self._final_key(n): spec for n, spec in self.state_specs.items()})
         specs.update(self.context_specs)
         specs.update(self.extra_replay_specs)
         specs["action"] = TensorSpec((self.num_actions,))
@@ -243,6 +264,10 @@ class SuperMimic:
             self.world_model_optimizer = torch.optim.Adam(
                 self.world_model.parameters(), lr=self._world_model_learning_rate
             )
+
+    @staticmethod
+    def _final_key(name: str) -> str:
+        return f"{name}@final"
 
     def train_mode(self):
         self.actor_critic.train()
@@ -305,13 +330,30 @@ class SuperMimic:
                 raise KeyError(f"replay component {name!r} missing from the observation groups")
             step[name] = pack[name].reshape(self.num_envs, -1).to(self.device).detach()
 
+        done = dones.to(self.device).reshape(self.num_envs, -1)[:, 0].bool()
+        if self.fit_terminal_transitions:
+            final = infos.get(self.final_observation_key) if isinstance(infos, dict) else None
+            if bool(done.any()) and final is None:
+                raise KeyError(
+                    "fit_terminal_transitions needs the pre-reset observations in"
+                    f" infos[{self.final_observation_key!r}] (enable the env's compute_final_obs), or set"
+                    " fit_terminal_transitions=False"
+                )
+            if final is not None and any(name not in final for name in self.state_names):
+                final = {**final, **self.imagination.split_obs_pack(final)}
+            for name in self.state_names:
+                reached = step[name]
+                if final is not None:
+                    terminal = final[name].reshape(self.num_envs, -1).to(self.device).detach()
+                    reached = torch.where(done.unsqueeze(-1), terminal, reached)
+                step[self._final_key(name)] = reached
+
         step["action"] = self._last_action.reshape(self.num_envs, -1)
         # The env may return (num_envs,) or (num_envs, num_rewards); normalise to 2-D so the stored
         # spec matches either shape.
         reward = rewards.to(self.device)
         step["reward"] = reward.reshape(self.num_envs, -1)
-        done = dones.to(self.device)
-        step["done"] = done.reshape(self.num_envs, -1)[:, :1].float()
+        step["done"] = done.float().unsqueeze(-1)
         self._episode_step = (self._episode_step + 1) * (1 - step["done"].squeeze(-1).long())
         step["episode_step"] = self._episode_step.clone()
         self.replay.add(step)
@@ -331,7 +373,8 @@ class SuperMimic:
             return dict(losses), dict(stats)
 
         warmup = current_learning_iteration < self.wm_warmup_iterations
-        cycles = 1 if warmup else self.updates_per_iteration
+        # the world model keeps its update-to-data ratio during the warmup too
+        cycles = self.updates_per_iteration
 
         for _ in range(cycles):
             for key, value in self._fit_world_model().items():
@@ -361,6 +404,16 @@ class SuperMimic:
         rng = self.replay.observed_range(self.state_names)
         lo = torch.cat([rng[n][0].reshape(-1) for n in self.state_names]).to(self.device)
         hi = torch.cat([rng[n][1].reshape(-1) for n in self.state_names]).to(self.device)
+        if self.fit_terminal_transitions:
+            # the states episodes ended in are data too; without them the clamp would hold imagined
+            # states short of every termination threshold the simulator reached
+            final = self.replay.observed_range([self._final_key(n) for n in self.state_names])
+            lo = torch.minimum(
+                lo, torch.cat([final[self._final_key(n)][0].reshape(-1) for n in self.state_names]).to(self.device)
+            )
+            hi = torch.maximum(
+                hi, torch.cat([final[self._final_key(n)][1].reshape(-1) for n in self.state_names]).to(self.device)
+            )
         return lo, hi
 
     def _clamp_state(self, state: torch.Tensor, bounds) -> torch.Tensor:
@@ -412,49 +465,48 @@ class SuperMimic:
             # 4096 envs large enough to exhaust the GPU. The replay holds envs independently, so one
             # random env per start is a valid sample of the same data.
             env_sel = torch.randint(0, self.num_envs, (self.wm_batch_size,), generator=self._noise_generator)
-            windows, mask = self.replay.sample_windows(
-                self.wm_batch_size, self.wm_horizon + 1, keys + ["action"], env_ids=env_sel
+            target_names = [self._final_key(n) for n in self.state_names] if self.fit_terminal_transitions else []
+            windows, _ = self.replay.sample_windows(
+                self.wm_batch_size,
+                self.wm_horizon + 1,
+                keys + target_names + ["action", self.replay.episode_key],
+                env_ids=env_sel,
             )
             # the replay lives on the CPU to keep GPU memory for activations
             windows = {k: v.to(self.device) for k, v in windows.items()}
-            mask = mask.to(self.device)
 
             def flatten(name, offset):
                 # ``(B, ...)``: one environment per sample, so the batch axis is already right.
                 return windows[name][:, offset]
 
+            def stack(names, rows):
+                return torch.cat([torch.cat([flatten(n, i) for n in names], dim=-1).unsqueeze(1) for i in rows], dim=1)
+
             # A replay row holds the state *after* a step and the action that produced it: row r is
             # (s_{r+1}, a_r). The transition from row i's state to row i+1's is therefore driven by
             # row i+1's action. Pairing it with row i's action would fit f(s_t, a_{t-1}) -> s_{t+1}
             # while imagination calls f(s_t, a_t), shifting every action Jacobian by one step.
-            state_seq = torch.cat(
-                [
-                    torch.cat([flatten(n, i) for n in self.state_names], dim=-1).unsqueeze(1)
-                    for i in range(self.wm_horizon + 1)
-                ],
-                dim=1,
-            )  # (B, k+1, state): rows i .. i+k
-            action_seq = torch.cat(
-                [flatten("action", i + 1).unsqueeze(1) for i in range(self.wm_horizon)],
-                dim=1,
-            )  # (B, k, action): rows i+1 .. i+k
+            state0 = stack(self.state_names, [0])[:, 0]  # (B, state): row i
+            # targets: the state each step reached, rows i+1 .. i+k. On a row that ended an episode that is
+            # the pre-reset state, so the model also learns the transitions into failure.
+            targets = stack(target_names or self.state_names, range(1, self.wm_horizon + 1))  # (B, k, state)
+            action_seq = stack(["action"], range(1, self.wm_horizon + 1))  # (B, k, action): rows i+1 .. i+k
             if self.context_names:
                 context = torch.cat([flatten(n, 0) for n in self.context_names], dim=-1)
             else:
                 context = None
-            flat_mask = mask.reshape(-1).to(torch.bool)
-
-            if not bool(flat_mask.any()):
-                continue
-            # Broadcast the per-window validity to every step: a window that crosses an episode reset
-            # describes a discontinuity, not dynamics, so it must not be fitted on.
-            losses = self.world_model.rollout_loss(
-                state_seq[:, 0],
-                action_seq,
-                context,
-                state_seq[:, 1:],
-                mask=flat_mask.unsqueeze(-1).expand(-1, self.wm_horizon),
+            # Step j (row i+j -> i+j+1) is valid while no episode ended on rows i+1 .. i+j, i.e. the model
+            # is still inside the window's first episode. Row i+j+1 itself may end it: with terminal
+            # targets that last transition is fitted, without them it is not.
+            reset = windows[self.replay.episode_key][:, 1:].reshape(self.wm_batch_size, -1) == 0  # (B, k)
+            alive_before = torch.cumprod(
+                torch.cat([torch.ones_like(reset[:, :1]), ~reset[:, :-1]], dim=1).to(torch.float32), dim=1
             )
+            step_mask = alive_before if self.fit_terminal_transitions else alive_before * (~reset).float()
+
+            if not bool(step_mask.any()):
+                continue
+            losses = self.world_model.rollout_loss(state0, action_seq, context, targets, mask=step_mask.bool())
             loss = losses["loss"]
             self.world_model_optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -479,8 +531,18 @@ class SuperMimic:
             # The stored action at a row is the action that *produced* that row's state, which is
             # exactly the ``last_action`` observation of that frame.
             keys = keys + ["action", self.replay.episode_key]
-        batch = self.replay.sample_starts(self.num_imagined, keys, history=history)
+        # Optionally the imagination rejects starts it cannot roll out H steps from (e.g. too close to the
+        # end of a reference clip); draw twice the batch and keep the first valid ones.
+        filter_starts = hasattr(self.imagination, "rollout_start_valid")
+        num = self.num_imagined * (2 if filter_starts else 1)
+        batch = self.replay.sample_starts(num, keys, history=history)
         batch = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in batch.items()}
+        if filter_starts:
+            seeds = {g: batch[g][:, -1] for g in self.seed_groups}
+            ok = self.imagination.rollout_start_valid(seeds, batch["env_index"], self.horizon).to(self.device)
+            # valid starts first; invalid ones only fill up a batch that is short of valid ones
+            keep = torch.argsort((~ok).to(torch.int8), stable=True)[: self.num_imagined]
+            batch = {k: v[keep] if torch.is_tensor(v) else v for k, v in batch.items()}
 
         def newest(names):
             return torch.cat([batch[n][:, -1] for n in names], dim=-1) if names else None
@@ -624,6 +686,22 @@ class SuperMimic:
             states.append(state)
             prev_actions.append(prev_action)
 
+        if self.use_critic:
+            # The critic is only ever evaluated and fit on imagined states, so its input statistics must
+            # cover them. Normalised with the real observations' statistics alone, a state the policy
+            # steers away from the data lands far outside the critic's input range, where the critic
+            # extrapolates and the policy climbs the extrapolation.
+            normalizer = getattr(self, "normalizers", {}).get("critic")
+            if normalizer is not None:
+                with torch.no_grad():
+                    normalizer.update(
+                        torch.cat(
+                            [
+                                self.imagination.critic_obs(states[t], context, self._ref_at(t, batch), prev_actions[t])
+                                for t in range(self.horizon + 1)
+                            ]
+                        )
+                    )
         values = [
             self._value(states[t], context, self._ref_at(t, batch), prev_actions[t]) for t in range(self.horizon + 1)
         ]
@@ -693,8 +771,10 @@ class SuperMimic:
         This is the SuperMimic gradient: the policy sees the consequences of its actions *through* the
         dynamics model, so a single differentiable rollout replaces PPO's importance-ratio surrogate.
 
-        The pass is chunked over the batch to bound activation memory; each chunk is one optimiser
-        step on its mean return.
+        The pass is chunked over the batch to bound activation memory. The chunks' gradients are
+        accumulated into one optimiser step on the whole batch (paper Table A.5: 4096 imagined rollouts
+        per update, one policy update per world-model update); a step per chunk would take
+        ``batch / chunk`` times as many policy steps per unit of data as the paper.
         """
         self.actor_critic.train()
         self.world_model.eval()
@@ -703,29 +783,31 @@ class SuperMimic:
         chunk = max(min(batch, self.policy_chunk_size), 1)
         total = 0.0
         reward_total = 0.0
-        steps = 0
+        survival_total = 0.0
+        self.policy_optimizer.zero_grad(set_to_none=True)
         for begin in range(0, batch, chunk):
             idx = torch.arange(begin, min(begin + chunk, batch), device=self.device)
-            objective, reward_sum = self._imagined_return(idx)
-            loss = -objective
-            self.policy_optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            if self.policy_max_grad_norm is not None:
-                nn.utils.clip_grad_norm_(self.policy_params, self.policy_max_grad_norm)
-            if self.policy_grad_value_clip is not None:
-                nn.utils.clip_grad_value_(self.policy_params, self.policy_grad_value_clip)
-            self.policy_optimizer.step()
-            total += float(objective.detach())
-            reward_total += float(reward_sum)
-            steps += 1
+            objective, reward_sum, survival = self._imagined_return(idx)
+            share = idx.numel() / batch
+            (-objective * share).backward()
+            total += float(objective.detach()) * share
+            reward_total += float(reward_sum) * share
+            survival_total += float(survival) * share
+        if self.policy_max_grad_norm is not None:
+            nn.utils.clip_grad_norm_(self.policy_params, self.policy_max_grad_norm)
+        if self.policy_grad_value_clip is not None:
+            nn.utils.clip_grad_value_(self.policy_params, self.policy_grad_value_clip)
+        self.policy_optimizer.step()
         # ``policy_return`` includes the critic's bootstrap, so it also moves as the critic learns;
         # ``imagined_reward`` is the H-step reward part alone, which only the policy changes.
-        return {"policy_return": total / max(steps, 1), "imagined_reward": reward_total / max(steps, 1)}
+        # ``imagined_survival`` is the mean survival weight c_H at the horizon.
+        return {"policy_return": total, "imagined_reward": reward_total, "imagined_survival": survival_total}
 
-    def _imagined_return(self, idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _imagined_return(self, idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Differentiable imagined objective for the batch rows ``idx`` (paper Eq. 2).
 
-        Returns the objective and, detached, its H-step reward part without the bootstrap.
+        Returns the objective and, detached, its H-step reward part without the bootstrap and the mean
+        survival weight at the horizon.
 
         ``J = sum_t gamma^t c_t r_{t+1} + gamma^H c_H V(s_H)``, with the soft survival weight
         ``c_0 = 1``, ``c_{t+1} = c_t (1 - d_{t+1})``, so returns after a likely termination are
@@ -756,7 +838,7 @@ class SuperMimic:
             state, prev_action = next_state, action
         reward_sum = total.detach().mean()
         total = total + discount * survival * self._value(state, context, ref_index, prev_action).squeeze(-1)
-        return total.mean(), reward_sum
+        return total.mean(), reward_sum, survival.detach().mean()
 
     # ------------------------------------------------------------------ bookkeeping
 

@@ -357,3 +357,49 @@ def test_history_window_restarts_at_the_episode_start():
     assert s[1].flatten().tolist() == [1, 1, 2, 3] and a[1].flatten().tolist() == [0, 0, 12, 13]
     # no reset inside the window: unchanged
     assert s[2].flatten().tolist() == [0, 1, 2, 3] and a[2].flatten().tolist() == [10, 11, 12, 13]
+
+
+def test_replay_observed_range_tracks_the_ring_contents():
+    """The cached range must equal a brute-force min/max over the rows the ring currently holds."""
+    gen = torch.Generator().manual_seed(0)
+    replay = ReplayStorage(
+        num_envs=3, capacity_per_env=5, specs={"x": TensorSpec((2,)), "episode_step": TensorSpec((), torch.long)}
+    )
+    written = []
+    for step in range(12):
+        x = torch.randn(3, 2, generator=gen) * (10.0 if step == 1 else 1.0)  # an outlier that ages out
+        written.append(x)
+        replay.add({"x": x, "episode_step": torch.full((3,), step, dtype=torch.long)})
+        if step >= 2:
+            lo, hi = replay.observed_range(["x"])["x"]
+            held = torch.stack(written[-5:])
+            assert torch.equal(lo, held.amin(dim=(0, 1))) and torch.equal(hi, held.amax(dim=(0, 1)))
+
+
+def test_replay_keeps_the_state_an_episode_ended_in():
+    """On a step that ends an episode the env already returns the next episode's first state; the
+    replay must also hold the state the step reached, so the world model can fit the final transition."""
+    torch.manual_seed(0)
+    env, algo = _build()
+    obs, extras = env.get_observations()
+    previous = None
+    checked = 0
+    for _ in range(40):
+        action = algo.act(obs, extras["observations"])
+        obs, reward, done, infos = env.step(action)
+        extra_obs = infos["observations"]
+        obs = extra_obs["policy"]
+        algo.process_env_step(reward, done, infos, obs, extra_obs)
+        row = (algo.replay._cursor - 1) % algo.replay.capacity_per_env
+        reached = algo.replay._buffers["joint_pos@final"][row]
+        stored = algo.replay._buffers["joint_pos"][row]
+        ended = done.bool()
+        # where no episode ended the reached state is the stored one
+        assert torch.equal(reached[~ended], stored[~ended])
+        if previous is not None and bool(ended.any()):
+            # the toy integrates the action exactly: the reached joints follow from the previous state
+            expected = previous[ended] + env.world.dt * algo.replay._buffers["action"][row][ended]
+            assert torch.allclose(reached[ended], expected, atol=1e-5)
+            checked += int(ended.sum())
+        previous = stored.clone()
+    assert checked > 0, "no episode ended during the test"
