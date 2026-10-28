@@ -99,7 +99,7 @@ class SuperMimic:
         policy_grad_value_clip: float | None = 0.1,
         policy_chunk_size: int = 1024,
         world_model_hidden_sizes: Sequence[int] = (2048, 2048, 2048),
-        world_model_predict_delta: Sequence[str] | str = "none",
+        world_model_predict_delta: Sequence[str] | str = "all",
         critic_max_grad_norm: float = 1.0,
         learning_rate: float | None = None,
         save_replay_in_checkpoint: bool = True,

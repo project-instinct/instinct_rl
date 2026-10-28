@@ -22,7 +22,7 @@ from instinct_rl.utils.returns import compute_gae, normalize_advantages
 DEVICE = "cpu"
 
 
-def _build(critic=True, horizon=8, wm_horizon=4, use_critic=True, num_imagined=64, warmup=0, num_envs=16):
+def _build(critic=True, horizon=8, wm_horizon=4, use_critic=True, num_imagined=64, warmup=0, num_envs=16, wm_batches=2):
     env = FakeVecEnv(num_envs=num_envs, episode_length=16)
     actor_critic = ActorCritic(
         obs_format=OBS_FORMAT,
@@ -49,7 +49,7 @@ def _build(critic=True, horizon=8, wm_horizon=4, use_critic=True, num_imagined=6
         wm_horizon=wm_horizon,
         use_critic=use_critic,
         num_imagined=num_imagined,
-        wm_batches_per_update=2,
+        wm_batches_per_update=wm_batches,
         wm_batch_size=32,
         critic_epochs=1,
         critic_mini_batches=2,
@@ -171,12 +171,14 @@ def test_replay_windows_are_contiguous_and_checkpointable():
 
 
 def test_supermimic_runs_and_improves_imagined_return():
+    # The world model gets a real fitting budget and a warm start: improving an imagined return only
+    # means something when the model it is imagined in describes the dynamics.
     torch.manual_seed(0)
-    env, algo = _build()
+    env, algo = _build(warmup=5, wm_batches=20)
     obs, extras = env.get_observations()
 
     returns = []
-    for iteration in range(30):
+    for iteration in range(35):
         for _ in range(5):
             action = algo.act(obs, extras["observations"])
             obs, reward, done, infos = env.step(action)
@@ -271,3 +273,34 @@ def test_world_model_batch_is_independent_of_num_envs():
     assert batch_sizes == {32}, f"world-model batch tracked num_envs: {recorded}"
     # and every batch really carried the configured window length
     assert all(k == 4 for *_, k in recorded), f"unexpected window length: {recorded}"
+
+
+def test_world_model_keeps_every_quaternion_unit():
+    """A component holding several quaternions must come out with *each* one of unit norm.
+
+    Normalising the flattened component as one vector scales n unit quaternions to 1/sqrt(n) each,
+    which silently corrupts every downstream rotation (rewards, base-frame observations).
+    """
+    torch.manual_seed(0)
+    model = WorldModel({"root_quat_w": (4,), "body_link_quat_w": (14, 4)}, action_size=2, hidden_sizes=(16,))
+    state = torch.randn(8, 4 + 14 * 4)
+    out = model(state, torch.randn(8, 2))
+    norms = torch.cat([out[:, :4], out[:, 4:]], dim=-1).reshape(8, 15, 4).norm(dim=-1)
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5), norms
+
+
+def test_world_model_fit_is_autoregressive():
+    """The k-step loss rolls the model on its own predictions (paper Eq. 1), not on logged states."""
+    torch.manual_seed(0)
+    model = WorldModel({"x": (3,)}, action_size=1, hidden_sizes=(16,), use_normalizer=False)
+    state0, actions, targets = torch.randn(4, 3), torch.randn(4, 3, 1), torch.randn(4, 3, 3)
+    with torch.no_grad():
+        pred, own, logged = state0, [], []
+        for j in range(3):
+            pred = model(pred, actions[:, j])
+            own.append(((pred - targets[:, j]) ** 2).mean())
+            start = state0 if j == 0 else targets[:, j - 1]
+            logged.append(((model(start, actions[:, j]) - targets[:, j]) ** 2).mean())
+        loss = model.rollout_loss(state0, actions, None, targets, update_normalizer=False)["loss"]
+    assert torch.isclose(loss, torch.stack(own).mean()), (loss, torch.stack(own).mean())
+    assert not torch.isclose(loss, torch.stack(logged).mean())

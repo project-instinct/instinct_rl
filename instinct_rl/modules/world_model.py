@@ -110,9 +110,7 @@ class WorldModel(nn.Module):
         # free numbers, so their norm drifts (measured: 1.0 -> 0.1 after ~10 open-loop steps) and every
         # consumer that inverts a rotation -- ``quat_inv`` divides by |q|^2 -- then amplifies the error.
         # Renormalising after every prediction keeps the rollout on the unit sphere.
-        self._quaternion_components = [
-            name for name in self.state_segments if name.endswith("quat_w")
-        ]
+        self._quaternion_components = [name for name in self.state_segments if name.endswith("quat_w")]
         self.action_size = int(action_size)
         if self.action_size <= 0:
             raise ValueError("action_size must be positive")
@@ -187,14 +185,20 @@ class WorldModel(nn.Module):
             offset += size
 
     def _renormalize_quaternions(self, state: torch.Tensor) -> torch.Tensor:
-        """Project quaternion components back onto the unit sphere."""
+        """Project every quaternion back onto the unit sphere.
+
+        A component may hold several quaternions (``(num_links, 4)``); each is normalised on its own.
+        Normalising the flattened component as one vector would scale ``n`` unit quaternions to norm
+        ``1 / sqrt(n)`` each.
+        """
         if not self._quaternion_components:
             return state
         chunks = []
         for name, sl in self._segment_slices():
             chunk = state[..., sl]
             if name in self._quaternion_components:
-                chunk = chunk / chunk.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                quats = chunk.reshape(*chunk.shape[:-1], -1, 4)
+                chunk = (quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-6)).reshape(chunk.shape)
             chunks.append(chunk)
         return torch.cat(chunks, dim=-1)
 
@@ -217,6 +221,39 @@ class WorldModel(nn.Module):
             else:
                 chunks.append(prediction[..., sl])
         return torch.cat(chunks, dim=-1)
+
+    def _update_normalizers(self, state0, actions, context, targets, mask) -> None:
+        """Update both normalisers from the *logged* transitions of a window.
+
+        Statistics come from ground truth only: an autoregressive fit also feeds the network its own
+        predictions, and folding those in would let the model's errors redefine its input scale.
+        The output normaliser sees the regression targets, so it also defines the error scale.
+        """
+        if self.input_normalizer is None:
+            return
+        steps = actions.shape[1]
+        logged_inputs = torch.cat([state0.unsqueeze(1), targets[:, :-1]], dim=1)  # s_0 .. s_{k-1}
+        valid = (
+            torch.ones(actions.shape[:2], dtype=torch.bool, device=actions.device)
+            if mask is None
+            else mask.to(torch.bool)
+        )
+        if not bool(valid.any()):
+            return
+        step_context = None if context is None else context.unsqueeze(1).expand(-1, steps, -1)
+        with torch.no_grad():
+            self.input_normalizer.update(self._concat(logged_inputs, actions, step_context)[valid])
+            self.output_normalizer.update(self._split_target(logged_inputs, targets)[valid])
+
+    def _error_scale(self) -> torch.Tensor | float:
+        """Per-dimension scale of the fitting error: the spread of the one-step regression target.
+
+        For delta components this is the typical one-step change; for absolute components, the spread
+        of the value itself. Without normalisers the error is left in raw units.
+        """
+        if self.output_normalizer is None:
+            return 1.0
+        return (self.output_normalizer._std + self.output_normalizer.eps).detach()
 
     # ------------------------------------------------------------------ forward
 
@@ -295,18 +332,27 @@ class WorldModel(nn.Module):
             raise ValueError(
                 f"actions and target_states disagree on (B, k): {tuple(actions.shape)} vs {tuple(target_states.shape)}"
             )
-        steps = actions.shape[1]
-        state = state0.reshape(state0.shape[0], self.state_size)
-        targets = target_states.reshape(target_states.shape[0], steps, self.state_size)
-        sq_err = []
+        batch, steps = actions.shape[0], actions.shape[1]
+        state = state0.reshape(batch, self.state_size)
+        targets = target_states.reshape(batch, steps, self.state_size)
+
+        if update_normalizer:
+            self._update_normalizers(state, actions, context, targets, mask)
+
+        # Autoregressive (paper Eq. 1): each step starts from the model's own previous prediction, and
+        # the gradient flows back through it. Restarting every step from the logged state instead would
+        # make this ``k`` independent one-step fits, and the model would never learn to correct the
+        # errors it makes on its own outputs -- the property long imagined rollouts depend on.
+        predictions = []
         for step in range(steps):
-            next_state = self.forward(state, actions[:, step], context, update_normalizer=update_normalizer)
-            sq_err.append((next_state - targets[:, step]) ** 2)
-            step_mask = None if mask is None else mask[:, step].unsqueeze(-1)
-            valid = torch.ones_like(next_state) if step_mask is None else step_mask.to(next_state.dtype)
-            # carry the ground-truth state forward so one bad step does not poison the rest
-            state = torch.where(valid > 0, targets[:, step], state)
-        sq_err = torch.stack(sq_err, dim=1)  # (B, k, state_size)
+            state = self.forward(state, actions[:, step], context)
+            predictions.append(state)
+        predictions = torch.stack(predictions, dim=1)  # (B, k, state_size)
+
+        # Errors are measured in units of each dimension's typical one-step change, so a joint angle
+        # and a link velocity count alike; in raw units the loss is dominated by the largest-valued
+        # components (here a ~70x spread in scale).
+        sq_err = ((predictions - targets) / self._error_scale()) ** 2  # (B, k, state_size)
 
         if mask is None:
             per_step = sq_err.mean(dim=-1)  # (B, k)
