@@ -171,13 +171,19 @@ class SuperMimic:
             if self.world_model is None
             else torch.optim.Adam(self.world_model.parameters(), lr=self._world_model_learning_rate)
         )
-        # paper Table A.5: Adam with beta = (0.9, 0.95) for the policy
-        self.policy_optimizer = torch.optim.Adam(
-            self.actor_critic.actor.parameters(), lr=policy_learning_rate, betas=(0.9, 0.95)
-        )
+        # The critic is the ``critic`` head plus a critic-only encoder if the model has one; the policy is
+        # every other parameter. Selecting ``actor`` alone would leave an actor-side encoder untrained.
         critic_params = list(self.actor_critic.critic.parameters())
+        critic_encoders = getattr(self.actor_critic, "critic_encoders", None)
+        if critic_encoders is not None and critic_encoders is not getattr(self.actor_critic, "encoders", None):
+            critic_params += list(critic_encoders.parameters())
         if not critic_params:
             raise ValueError("SuperMimic needs a critic network in the actor_critic (even if use_critic is False)")
+        critic_ids = {id(p) for p in critic_params}
+        self.policy_params = [p for p in self.actor_critic.parameters() if id(p) not in critic_ids]
+        self.critic_params = critic_params
+        # paper Table A.5: Adam with beta = (0.9, 0.95) for the policy
+        self.policy_optimizer = torch.optim.Adam(self.policy_params, lr=policy_learning_rate, betas=(0.9, 0.95))
         self.critic_optimizer = torch.optim.Adam(critic_params, lr=critic_learning_rate)
 
         self.world_model_max_grad_norm = world_model_max_grad_norm
@@ -636,7 +642,7 @@ class SuperMimic:
                 self.critic_optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 if self.critic_max_grad_norm is not None:
-                    nn.utils.clip_grad_norm_(self.actor_critic.critic.parameters(), self.critic_max_grad_norm)
+                    nn.utils.clip_grad_norm_(self.critic_params, self.critic_max_grad_norm)
                 self.critic_optimizer.step()
                 total += float(loss.detach())
                 count += 1
@@ -666,9 +672,9 @@ class SuperMimic:
             self.policy_optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if self.policy_max_grad_norm is not None:
-                nn.utils.clip_grad_norm_(self.actor_critic.actor.parameters(), self.policy_max_grad_norm)
+                nn.utils.clip_grad_norm_(self.policy_params, self.policy_max_grad_norm)
             if self.policy_grad_value_clip is not None:
-                nn.utils.clip_grad_value_(self.actor_critic.actor.parameters(), self.policy_grad_value_clip)
+                nn.utils.clip_grad_value_(self.policy_params, self.policy_grad_value_clip)
             self.policy_optimizer.step()
             total += float(objective.detach())
             reward_total += float(reward_sum)
@@ -720,6 +726,8 @@ class SuperMimic:
 
     def state_dict(self) -> dict:
         state = {
+            # the policy and critic, under the key PPO uses, so play/export scripts find them
+            "model_state_dict": self.actor_critic.state_dict(),
             "world_model": self.world_model.state_dict(),
             "world_model_optimizer": self.world_model_optimizer.state_dict(),
             "policy_optimizer": self.policy_optimizer.state_dict(),
@@ -732,10 +740,11 @@ class SuperMimic:
         return state
 
     def load_state_dict(self, state: dict) -> None:
-        required = {"world_model", "world_model_optimizer", "policy_optimizer", "critic_optimizer"}
+        required = {"model_state_dict", "world_model", "world_model_optimizer", "policy_optimizer", "critic_optimizer"}
         missing = required - set(state)
         if missing:
             raise KeyError(f"checkpoint is missing SuperMimic entries: {sorted(missing)}")
+        self.actor_critic.load_state_dict(state["model_state_dict"])
         self.world_model.load_state_dict(state["world_model"])
         self.world_model_optimizer.load_state_dict(state["world_model_optimizer"])
         self.policy_optimizer.load_state_dict(state["policy_optimizer"])

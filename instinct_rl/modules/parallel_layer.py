@@ -67,7 +67,7 @@ class ParallelLayer(nn.Module):
                 output_size,
             ]
             model = MlpModel(
-                np.sum(np.prod(s) for s in input_component_shapes),
+                int(sum(np.prod(s) for s in input_component_shapes)),
                 hidden_sizes=hidden_sizes,
                 output_size=None,
                 **model_kwargs,

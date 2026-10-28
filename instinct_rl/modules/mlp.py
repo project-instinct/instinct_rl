@@ -9,6 +9,9 @@ class MlpModel(torch.nn.Module):
         hidden_sizes (list): can be empty list for none (linear model).
         output_size: linear layer at output, or if ``None``, the last hidden size will be the output size and will have nonlinearity applied
         nonlinearity: torch nonlinearity Module (not Functional).
+        output_nonlinearity: optional nonlinearity for the output instead of ``nonlinearity`` (e.g.
+            ``"Tanh"`` for a bounded latent). With ``output_size=None`` it replaces the last hidden
+            layer's nonlinearity; otherwise it is applied after the output layer.
     """
 
     def __init__(
@@ -17,6 +20,7 @@ class MlpModel(torch.nn.Module):
         hidden_sizes,  # Can be empty list or None for none.
         output_size=None,  # if None, last layer has nonlinearity applied.
         nonlinearity=torch.nn.ReLU,  # Module, not Functional.
+        output_nonlinearity=None,
     ):
         super().__init__()
         if isinstance(hidden_sizes, int):
@@ -34,6 +38,15 @@ class MlpModel(torch.nn.Module):
         if output_size is not None:
             last_size = hidden_sizes[-1] if hidden_sizes else input_size
             sequence.append(torch.nn.Linear(last_size, output_size))
+        if output_nonlinearity is not None:
+            if isinstance(output_nonlinearity, str):
+                output_nonlinearity = getattr(torch.nn, output_nonlinearity)
+            if output_size is None:
+                if not hidden_layers:
+                    raise ValueError("output_nonlinearity needs a hidden layer or an output layer to act on")
+                sequence[-1] = output_nonlinearity()
+            else:
+                sequence.append(output_nonlinearity())
         self.model = torch.nn.Sequential(*sequence)
         self._output_size = hidden_sizes[-1] if output_size is None else output_size
 

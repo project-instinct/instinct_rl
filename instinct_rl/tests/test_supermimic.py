@@ -216,6 +216,9 @@ def test_supermimic_checkpoint_round_trip():
     _, algo2 = _build()
     algo2.load_state_dict(state)
     assert torch.equal(next(iter(algo.world_model.parameters())), next(iter(algo2.world_model.parameters())))
+    # the trained policy must survive the round trip, or a checkpoint cannot be played or resumed
+    for p, q in zip(algo.actor_critic.parameters(), algo2.actor_critic.parameters()):
+        assert torch.equal(p, q)
     assert len(algo2.replay) == len(algo.replay)
 
     torch.save(state, "/tmp/instinct_rl_supermimic_test.pt")
