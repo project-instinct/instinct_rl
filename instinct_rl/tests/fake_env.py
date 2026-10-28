@@ -134,7 +134,7 @@ class FakeVecEnv:
         self.world = ToyAnalyticWorld(device=device)
         self.imagination = ToyImagination(device=device)
         self.generator = torch.Generator().manual_seed(seed)
-        self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long)
+        self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.state, self.context = self.world.sample(self.num_envs, generator=self.generator)
         self.state = self.state.to(self.device)
         self.context = self.context.to(self.device)

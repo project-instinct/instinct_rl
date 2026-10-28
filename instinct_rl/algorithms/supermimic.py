@@ -72,6 +72,11 @@ class SuperMimic:
             ``infos[final_observation_key]`` (IsaacLab's ``compute_final_obs``). Without it the model
             never sees a fall and imagines the robot surviving far more often than it does.
         final_observation_key: Key of the pre-reset observation groups in the step ``infos``.
+        policy_cuda_graph: Capture one chunk of the differentiable policy pass (32-step rollout and its
+            backward) in a CUDA graph and replay it per chunk. The pass is otherwise bound by kernel
+            launches. Needs a CUDA device and a batch that is a multiple of ``policy_chunk_size``.
+        world_model_cuda_graph: Likewise replay each world-model batch's k-step loss and backward as a
+            captured CUDA graph (the normaliser statistics are updated outside it).
     """
 
     #: Observation group carrying the simulation context.
@@ -113,6 +118,8 @@ class SuperMimic:
         save_replay_in_checkpoint: bool = True,
         fit_terminal_transitions: bool = True,
         final_observation_key: str = "final_observations",
+        policy_cuda_graph: bool = False,
+        world_model_cuda_graph: bool = False,
         device: str | torch.device = "cpu",
         **kwargs,
     ):
@@ -169,6 +176,10 @@ class SuperMimic:
         self._in_torch_profile = False
         self.save_replay_in_checkpoint = bool(save_replay_in_checkpoint)
         self.fit_terminal_transitions = bool(fit_terminal_transitions)
+        self.policy_cuda_graph = bool(policy_cuda_graph)
+        self._policy_graph: dict | None = None
+        self.world_model_cuda_graph = bool(world_model_cuda_graph)
+        self._world_model_graph: dict | None = None
         self.final_observation_key = str(final_observation_key)
         # The runner logs `alg.learning_rate`; report the policy rate as the headline number.
         self.learning_rate = float(policy_learning_rate if learning_rate is None else learning_rate)
@@ -505,69 +516,115 @@ class SuperMimic:
         return torch.cat([pack[name].reshape(pack[name].shape[0], -1) for name in self.context_names], dim=-1)
 
     def _fit_world_model(self) -> dict[str, float]:
-        """Fit the dynamics model on short windows from the replay."""
+        """Fit the dynamics model on short windows from the replay.
+
+        All ``wm_batches_per_update`` batches are drawn in one replay gather and moved to the device in
+        one copy, then fitted one after another (one optimiser step each).
+        """
         self.world_model.train()
         keys = self.state_names + self.context_names
-        total = defaultdict(float)
-        for _ in range(self.wm_batches_per_update):
-            # Draw one environment per start. Without ``env_ids`` the sampler returns every
-            # environment for each start, and folding those dimensions makes the world-model batch
-            # ``wm_batch_size * num_envs`` -- a silently different batch on every machine, and at
-            # 4096 envs large enough to exhaust the GPU. The replay holds envs independently, so one
-            # random env per start is a valid sample of the same data.
-            env_sel = torch.randint(0, self.num_envs, (self.wm_batch_size,), generator=self._noise_generator)
-            target_names = [self._final_key(n) for n in self.state_names] if self.fit_terminal_transitions else []
-            windows, _ = self.replay.sample_windows(
-                self.wm_batch_size,
-                self.wm_horizon + 1,
-                keys + target_names + ["action", self.replay.episode_key],
-                env_ids=env_sel,
+        target_names = [self._final_key(n) for n in self.state_names] if self.fit_terminal_transitions else []
+        size, count = self.wm_batch_size, self.wm_batches_per_update
+        # Draw one environment per start. Without ``env_ids`` the sampler returns every environment for
+        # each start, and folding those dimensions makes the world-model batch ``wm_batch_size *
+        # num_envs`` -- a silently different batch on every machine, and at 4096 envs large enough to
+        # exhaust the GPU. The replay holds envs independently, so one random env per start is a valid
+        # sample of the same data.
+        env_sel = torch.randint(0, self.num_envs, (size * count,), generator=self._noise_generator)
+        windows, _ = self.replay.sample_windows(
+            size * count,
+            self.wm_horizon + 1,
+            keys + target_names + ["action", self.replay.episode_key],
+            env_ids=env_sel,
+        )
+        # the replay lives on the CPU to keep GPU memory for activations
+        windows = {k: v.to(self.device, non_blocking=True) for k, v in windows.items()}
+
+        def stack(names, rows):
+            return torch.cat([torch.cat([windows[n][:, i] for n in names], dim=-1).unsqueeze(1) for i in rows], dim=1)
+
+        # A replay row holds the state *after* a step and the action that produced it: row r is
+        # (s_{r+1}, a_r). The transition from row i's state to row i+1's is therefore driven by row i+1's
+        # action. Pairing it with row i's action would fit f(s_t, a_{t-1}) -> s_{t+1} while imagination
+        # calls f(s_t, a_t), shifting every action Jacobian by one step.
+        state0 = stack(self.state_names, [0])[:, 0]  # (N, state): row i
+        # targets: the state each step reached, rows i+1 .. i+k. On a row that ended an episode that is the
+        # pre-reset state, so the model also learns the transitions into failure.
+        targets = stack(target_names or self.state_names, range(1, self.wm_horizon + 1))  # (N, k, state)
+        action_seq = stack(["action"], range(1, self.wm_horizon + 1))  # (N, k, action): rows i+1 .. i+k
+        context = torch.cat([windows[n][:, 0] for n in self.context_names], dim=-1) if self.context_names else None
+        # Step j (row i+j -> i+j+1) is valid while no episode ended on rows i+1 .. i+j, i.e. the model is
+        # still inside the window's first episode. Row i+j+1 itself may end it: with terminal targets
+        # that last transition is fitted, without them it is not.
+        reset = windows[self.replay.episode_key][:, 1:].reshape(size * count, -1) == 0  # (N, k)
+        alive_before = torch.cumprod(
+            torch.cat([torch.ones_like(reset[:, :1]), ~reset[:, :-1]], dim=1).to(torch.float32), dim=1
+        )
+        step_mask = (alive_before if self.fit_terminal_transitions else alive_before * (~reset).float()).bool()
+
+        graphed = self.world_model_cuda_graph and self.device.type == "cuda"
+        total = torch.zeros((), device=self.device)
+        for b in range(count):
+            rows = slice(b * size, (b + 1) * size)
+            batch = (
+                state0[rows],
+                action_seq[rows],
+                None if context is None else context[rows],
+                targets[rows],
+                step_mask[rows],
             )
-            # the replay lives on the CPU to keep GPU memory for activations
-            windows = {k: v.to(self.device) for k, v in windows.items()}
-
-            def flatten(name, offset):
-                # ``(B, ...)``: one environment per sample, so the batch axis is already right.
-                return windows[name][:, offset]
-
-            def stack(names, rows):
-                return torch.cat([torch.cat([flatten(n, i) for n in names], dim=-1).unsqueeze(1) for i in rows], dim=1)
-
-            # A replay row holds the state *after* a step and the action that produced it: row r is
-            # (s_{r+1}, a_r). The transition from row i's state to row i+1's is therefore driven by
-            # row i+1's action. Pairing it with row i's action would fit f(s_t, a_{t-1}) -> s_{t+1}
-            # while imagination calls f(s_t, a_t), shifting every action Jacobian by one step.
-            state0 = stack(self.state_names, [0])[:, 0]  # (B, state): row i
-            # targets: the state each step reached, rows i+1 .. i+k. On a row that ended an episode that is
-            # the pre-reset state, so the model also learns the transitions into failure.
-            targets = stack(target_names or self.state_names, range(1, self.wm_horizon + 1))  # (B, k, state)
-            action_seq = stack(["action"], range(1, self.wm_horizon + 1))  # (B, k, action): rows i+1 .. i+k
-            if self.context_names:
-                context = torch.cat([flatten(n, 0) for n in self.context_names], dim=-1)
+            if graphed:
+                # statistics from the logged data, outside the graph (their update checks for non-finite
+                # batches on the host); the graphed loss reads them in place
+                self.world_model._update_normalizers(*batch)
+                loss = self._graphed_world_model_loss(batch)
             else:
-                context = None
-            # Step j (row i+j -> i+j+1) is valid while no episode ended on rows i+1 .. i+j, i.e. the model
-            # is still inside the window's first episode. Row i+j+1 itself may end it: with terminal
-            # targets that last transition is fitted, without them it is not.
-            reset = windows[self.replay.episode_key][:, 1:].reshape(self.wm_batch_size, -1) == 0  # (B, k)
-            alive_before = torch.cumprod(
-                torch.cat([torch.ones_like(reset[:, :1]), ~reset[:, :-1]], dim=1).to(torch.float32), dim=1
-            )
-            step_mask = alive_before if self.fit_terminal_transitions else alive_before * (~reset).float()
-
-            if not bool(step_mask.any()):
-                continue
-            losses = self.world_model.rollout_loss(state0, action_seq, context, targets, mask=step_mask.bool())
-            loss = losses["loss"]
-            self.world_model_optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+                self.world_model_optimizer.zero_grad(set_to_none=True)
+                loss = self.world_model.rollout_loss(batch[0], batch[1], batch[2], batch[3], mask=batch[4])["loss"]
+                loss.backward()
             if self.world_model_max_grad_norm is not None:
                 nn.utils.clip_grad_norm_(self.world_model.parameters(), self.world_model_max_grad_norm)
             self.world_model_optimizer.step()
-            total["world_model_loss"] += float(loss.detach())
-        return {k: v / max(self.wm_batches_per_update, 1) for k, v in total.items()}
+            total += loss.detach()
+        return {"world_model_loss": float(total) / max(count, 1)}
 
-    @torch.no_grad()
+    def _graphed_world_model_loss(self, batch) -> torch.Tensor:
+        """The k-step world-model loss and its backward as one CUDA-graph replay (fresh gradients)."""
+        graph = self._world_model_graph
+        if graph is None or any(
+            (a is None) != (b is None) or (a is not None and a.shape != b.shape) for a, b in zip(graph["inputs"], batch)
+        ):
+            inputs = [None if t is None else t.detach().clone() for t in batch]
+            params = [p for p in self.world_model.parameters() if p.requires_grad]
+
+            def run():
+                for p in params:
+                    p.grad.zero_()
+                loss = self.world_model.rollout_loss(
+                    inputs[0], inputs[1], inputs[2], inputs[3], mask=inputs[4], update_normalizer=False
+                )["loss"]
+                loss.backward()
+                return loss.detach()
+
+            for p in params:
+                if p.grad is None:
+                    p.grad = torch.zeros_like(p)
+            side = torch.cuda.Stream(device=self.device)
+            side.wait_stream(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(side):
+                for _ in range(2):
+                    run()
+            torch.cuda.current_stream(self.device).wait_stream(side)
+            cuda_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cuda_graph):
+                output = run()
+            graph = self._world_model_graph = {"graph": cuda_graph, "inputs": inputs, "output": output}
+        for static, value in zip(graph["inputs"], batch):
+            if static is not None:
+                static.copy_(value)
+        graph["graph"].replay()
+        return graph["output"].clone()
+
     def _sample_imagined_starts(self) -> dict:
         """Draw start states from the replay, with what the imagination needs to continue from them.
 
@@ -745,7 +802,13 @@ class SuperMimic:
         """Draw (or take) the rollout start states and set up the reference window for them."""
         if start is None:
             start = self._sample_imagined_starts()
-        self._bounds = self._state_bounds()
+        bounds = self._state_bounds()
+        if bounds is None or self._bounds is None or self._bounds[0].shape != bounds[0].shape:
+            self._bounds = bounds
+        else:
+            # in place: the clamp in a captured policy graph reads these addresses
+            self._bounds[0].copy_(bounds[0])
+            self._bounds[1].copy_(bounds[1])
         has_reference = False
         if hasattr(self.imagination, "begin_rollout"):
             has_reference = self.imagination.begin_rollout(start["seeds"], start["env_index"], self.horizon) is not None
@@ -842,25 +905,39 @@ class SuperMimic:
         reward_total = torch.zeros((), device=self.device)
         survival_total = torch.zeros((), device=self.device)
         pieces = []
-        self.policy_optimizer.zero_grad(set_to_none=True)
-        for begin in range(0, batch, chunk):
-            idx = torch.arange(begin, min(begin + chunk, batch), device=self.device)
-            with torch.profiler.record_function("sm_policy_forward"):
-                objective, reward_sum, survival, trajectory = self._imagined_return(idx, keep_trajectory=True)
-            share = idx.numel() / batch
-            with torch.profiler.record_function("sm_policy_backward"):
-                (-objective * share).backward()
-            total += objective.detach() * share
-            reward_total += reward_sum * share
-            survival_total += survival * share
-            pieces.append(trajectory)
+        graphed = self.policy_cuda_graph and self.device.type == "cuda" and batch % chunk == 0
+        # Only the policy is optimised here: the world model and critic weights are constants of the
+        # objective, so their weight gradients are not computed (or accumulated into their .grad).
+        frozen = [p for p in list(self.world_model.parameters()) + list(self.critic_params) if p.requires_grad]
+        for p in frozen:
+            p.requires_grad_(False)
+        try:
+            # kept allocated (not None) across updates: a captured graph accumulates into these tensors
+            self.policy_optimizer.zero_grad(set_to_none=not graphed)
+            for begin in range(0, batch, chunk):
+                idx = torch.arange(begin, min(begin + chunk, batch), device=self.device)
+                share = idx.numel() / batch
+                if graphed:
+                    objective, reward_sum, survival, trajectory = self._graphed_policy_chunk(idx, share)
+                else:
+                    with torch.profiler.record_function("sm_policy_forward"):
+                        objective, reward_sum, survival, trajectory = self._imagined_return(idx, keep_trajectory=True)
+                    with torch.profiler.record_function("sm_policy_backward"):
+                        (-objective * share).backward()
+                total += objective.detach() * share
+                reward_total += reward_sum * share
+                survival_total += survival * share
+                pieces.append(trajectory)
+        finally:
+            for p in frozen:
+                p.requires_grad_(True)
         rollout = {k: torch.cat([p[k] for p in pieces], dim=1) for k in pieces[0]}
 
         grad_norm = torch.zeros((), device=self.device)
         if self.policy_max_grad_norm is not None:
             grad_norm = nn.utils.clip_grad_norm_(self.policy_params, self.policy_max_grad_norm)
         if not bool(torch.isfinite(grad_norm)) or not self._imagined_is_finite(rollout):
-            self.policy_optimizer.zero_grad(set_to_none=True)
+            self.policy_optimizer.zero_grad(set_to_none=not graphed)
             return {}, None
         if self.policy_grad_value_clip is not None:
             nn.utils.clip_grad_value_(self.policy_params, self.policy_grad_value_clip)
@@ -875,6 +952,75 @@ class SuperMimic:
         }
         return losses, rollout
 
+    def _graphed_policy_chunk(self, idx: torch.Tensor, share: float):
+        """One chunk of the policy pass (rollout + backward of ``-share * J``) as a CUDA-graph replay.
+
+        The graph is captured on first use for this chunk size and share. Its inputs are static
+        tensors: the start rows are copied into them, the reference window is narrowed into the
+        imagination's persistent per-size window, and the state bounds and normaliser statistics are
+        updated in place. Gradients accumulate into the policy's ``.grad`` tensors, which therefore must
+        stay allocated. Returns detached copies of the chunk's outputs.
+        """
+        rows = self._rows(idx)  # narrows the reference window (in place) and gathers the start rows
+        key = (idx.numel(), share)
+        graph = self._policy_graph
+        if (
+            graph is None
+            or graph["key"] != key
+            or any(
+                (a is None) != (b is None) or (a is not None and a.shape != b.shape)
+                for a, b in zip(graph["inputs"], rows)
+            )
+        ):
+            graph = self._policy_graph = self._capture_policy_chunk(rows, key)
+        for static, value in zip(graph["inputs"], rows):
+            if static is not None:
+                static.copy_(value)
+        graph["graph"].replay()
+        objective, reward_sum, survival, trajectory = graph["outputs"]
+        return (
+            objective.clone(),
+            reward_sum.clone(),
+            survival.clone(),
+            {k: v.clone() for k, v in trajectory.items()},
+        )
+
+    def _capture_policy_chunk(self, rows, key) -> dict:
+        share = key[1]
+        inputs = [None if t is None else t.detach().clone() for t in rows]
+
+        def run():
+            out = self._rollout_objective(*inputs, keep_trajectory=True)
+            (-out[0] * share).backward()
+            return out
+
+        # The graph replaces the eager pass, so the gradients of the warm-up runs must not survive.
+        grads = [p.grad.detach().clone() if p.grad is not None else None for p in self.policy_params]
+        for p in self.policy_params:
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+        side = torch.cuda.Stream(device=self.device)
+        side.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                run()
+        torch.cuda.current_stream(self.device).wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = run()
+        for p, g in zip(self.policy_params, grads):
+            if g is None:
+                p.grad.zero_()
+            else:
+                p.grad.copy_(g)
+        detached = (
+            outputs[0].detach(),
+            outputs[1].detach(),
+            outputs[2].detach(),
+            {k: v.detach() for k, v in outputs[3].items()},
+        )
+        return {"key": key, "graph": graph, "inputs": inputs, "outputs": detached}
+
     def _imagined_return(self, idx: torch.Tensor, keep_trajectory: bool = False):
         """Differentiable imagined objective for the batch rows ``idx`` (paper Eq. 2).
 
@@ -886,7 +1032,13 @@ class SuperMimic:
         ``c_0 = 1``, ``c_{t+1} = c_t (1 - d_{t+1})``, so returns after a likely termination are
         discounted away while the gradient through ``d`` is kept.
         """
-        state, context, history_state, history_action = self._rows(idx)
+        return self._rollout_objective(*self._rows(idx), keep_trajectory=keep_trajectory)
+
+    def _rollout_objective(self, state, context, history_state, history_action, keep_trajectory: bool = False):
+        """:meth:`_imagined_return` from explicit start tensors (the rows the reference window holds).
+
+        Free of host synchronisation, so it can be captured in a CUDA graph.
+        """
         batch = state.shape[0]
         ref_index = self._ref_at(0, batch)
         prev_action = self._first_prev_action(history_action, batch)

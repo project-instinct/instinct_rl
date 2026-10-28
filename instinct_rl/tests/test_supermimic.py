@@ -23,8 +23,18 @@ from instinct_rl.utils.returns import compute_gae, normalize_advantages
 DEVICE = "cpu"
 
 
-def _build(critic=True, horizon=8, wm_horizon=4, use_critic=True, num_imagined=64, warmup=0, num_envs=16, wm_batches=2):
-    env = FakeVecEnv(num_envs=num_envs, episode_length=16)
+def _build(
+    critic=True,
+    horizon=8,
+    wm_horizon=4,
+    use_critic=True,
+    num_imagined=64,
+    warmup=0,
+    num_envs=16,
+    wm_batches=2,
+    device=DEVICE,
+):
+    env = FakeVecEnv(num_envs=num_envs, episode_length=16, device=device)
     actor_critic = ActorCritic(
         obs_format=OBS_FORMAT,
         num_actions=NUM_ACTIONS,
@@ -57,7 +67,7 @@ def _build(critic=True, horizon=8, wm_horizon=4, use_critic=True, num_imagined=6
         updates_per_iteration=1,
         wm_warmup_iterations=warmup,
         collection_noise_std=0.1,
-        device=DEVICE,
+        device=device,
     )
     algo.init_storage(env.num_envs, 5, OBS_FORMAT, NUM_ACTIONS, num_rewards=1)
     return env, algo
@@ -403,3 +413,83 @@ def test_replay_keeps_the_state_an_episode_ended_in():
             checked += int(ended.sum())
         previous = stored.clone()
     assert checked > 0, "no episode ended during the test"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_graphed_policy_pass_matches_eager():
+    """The CUDA-graph replay of a policy chunk must give the eager pass's gradients and outputs, also
+    for later updates whose start states differ from the ones the graph was captured with."""
+    torch.manual_seed(0)
+    env, algo = _build(device="cuda", num_imagined=64)
+    obs, extras = env.get_observations()
+    for _ in range(12):
+        action = algo.act(obs, extras["observations"])
+        obs, reward, done, infos = env.step(action)
+        extra_obs = infos["observations"]
+        obs = extra_obs["policy"]
+        algo.process_env_step(reward, done, infos, obs, extra_obs)
+    chunks = [torch.arange(0, 32, device="cuda"), torch.arange(32, 64, device="cuda")]
+
+    def grads():
+        # parameters the return does not depend on (the action-noise ``std``) may have no gradient
+        return [torch.zeros_like(p) if p.grad is None else p.grad.detach().clone() for p in algo.policy_params]
+
+    for _ in range(3):  # capture on the first update, replay on the next ones
+        algo._begin_imagination()
+        algo.policy_optimizer.zero_grad(set_to_none=False)
+        eager = []
+        for idx in chunks:
+            out = algo._imagined_return(idx, keep_trajectory=True)
+            (-out[0] * 0.5).backward()
+            # keep values only: a live autograd graph pins the parameters' AccumulateGrad nodes to the
+            # default stream, which a later graph capture must not depend on
+            eager.append((out[0].detach(), out[1], out[2], out[3]))
+            del out
+        expected = grads()
+        algo.policy_optimizer.zero_grad(set_to_none=False)
+        graphed = [algo._graphed_policy_chunk(idx, 0.5) for idx in chunks]
+        for e, g in zip(expected, grads()):
+            assert torch.allclose(e, g, atol=1e-5, rtol=1e-4), (e - g).abs().max()
+        for e, g in zip(eager, graphed):
+            assert torch.allclose(e[0].detach(), g[0], atol=1e-6)
+            for k in e[3]:
+                assert torch.allclose(e[3][k], g[3][k], atol=1e-5), k
+        # a policy step between updates: the graph must read the new weights
+        algo.policy_optimizer.step()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_graphed_world_model_fit_matches_eager():
+    """The CUDA-graph replay of a world-model batch gives the eager loss and gradients, on new data too."""
+    torch.manual_seed(0)
+    env, algo = _build(device="cuda")
+    obs, extras = env.get_observations()
+    for _ in range(12):
+        action = algo.act(obs, extras["observations"])
+        obs, reward, done, infos = env.step(action)
+        extra_obs = infos["observations"]
+        obs = extra_obs["policy"]
+        algo.process_env_step(reward, done, infos, obs, extra_obs)
+    wm = algo.world_model
+    params = [p for p in wm.parameters() if p.requires_grad]
+    for _ in range(3):
+        state0 = torch.randn(32, wm.state_size, device="cuda")
+        actions = torch.randn(32, 4, wm.action_size, device="cuda")
+        context = torch.rand(32, wm.context_size, device="cuda")
+        targets = state0.unsqueeze(1) + 0.1 * torch.randn(32, 4, wm.state_size, device="cuda")
+        mask = torch.rand(32, 4, device="cuda") > 0.2
+        batch = (state0, actions, context, targets, mask)
+        wm._update_normalizers(*batch)
+        for p in params:  # zeroed in place: the graph holds these gradient tensors
+            if p.grad is not None:
+                p.grad.zero_()
+        loss = wm.rollout_loss(*batch[:4], mask=mask, update_normalizer=False)["loss"]
+        loss.backward()
+        eager = loss.detach().clone()
+        del loss  # a live autograd graph would tie the capture to the default stream
+        expected = [p.grad.detach().clone() for p in params]
+        graphed = algo._graphed_world_model_loss(batch)
+        assert torch.allclose(eager, graphed, rtol=1e-5, atol=1e-6)
+        for e, p in zip(expected, params):
+            assert torch.allclose(e, p.grad, rtol=1e-4, atol=1e-6)
+        algo.world_model_optimizer.step()  # the graph must read the updated weights next time

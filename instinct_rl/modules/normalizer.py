@@ -107,7 +107,8 @@ class EmpiricalNormalization(nn.Module):
             self._inc_count = new_count
         else:
             self.count = new_count
-            self._std = torch.sqrt(self._var)
+            # in place: a captured CUDA graph that normalises reads this buffer's address
+            self._std.copy_(torch.sqrt(self._var))
 
     @torch.jit.unused
     def inverse(self, y):
