@@ -4,6 +4,7 @@ Run with ``python -m pytest instinct_rl/tests/test_supermimic.py`` or directly w
 These tests use the toy environment in ``fake_env.py`` and run in about ten seconds on CPU.
 """
 
+import pytest
 import torch
 
 from instinct_rl.algorithms.supermimic import SuperMimic
@@ -170,11 +171,13 @@ def test_replay_windows_are_contiguous_and_checkpointable():
     assert torch.equal(r._buffers["s"], r2._buffers["s"])
 
 
-def test_supermimic_runs_and_improves_imagined_return():
+@pytest.mark.parametrize("use_critic", [True, False])
+def test_supermimic_runs_and_improves_imagined_return(use_critic):
     # The world model gets a real fitting budget and a warm start: improving an imagined return only
-    # means something when the model it is imagined in describes the dynamics.
+    # means something when the model it is imagined in describes the dynamics. ``use_critic=False`` is
+    # the paper's critic ablation: the policy bootstraps with zero and no critic is fitted.
     torch.manual_seed(0)
-    env, algo = _build(warmup=5, wm_batches=20)
+    env, algo = _build(warmup=5, wm_batches=20, use_critic=use_critic)
     obs, extras = env.get_observations()
 
     returns = []

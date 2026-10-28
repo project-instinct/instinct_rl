@@ -345,8 +345,9 @@ class SuperMimic:
             if not self._imagined_is_finite(imagined):
                 stats["imagined_skipped"] += 1.0
                 continue
-            for key, value in self._fit_critic(imagined).items():
-                losses[key] += value
+            if self.use_critic:
+                for key, value in self._fit_critic(imagined).items():
+                    losses[key] += value
             for key, value in self._fit_policy(imagined).items():
                 losses[key] += value
 
