@@ -422,18 +422,21 @@ class SuperMimic:
                 # ``(B, ...)``: one environment per sample, so the batch axis is already right.
                 return windows[name][:, offset]
 
-            # states at t..t+k, actions at t..t+k-1, stacked over the window
+            # A replay row holds the state *after* a step and the action that produced it: row r is
+            # (s_{r+1}, a_r). The transition from row i's state to row i+1's is therefore driven by
+            # row i+1's action. Pairing it with row i's action would fit f(s_t, a_{t-1}) -> s_{t+1}
+            # while imagination calls f(s_t, a_t), shifting every action Jacobian by one step.
             state_seq = torch.cat(
                 [
                     torch.cat([flatten(n, i) for n in self.state_names], dim=-1).unsqueeze(1)
                     for i in range(self.wm_horizon + 1)
                 ],
                 dim=1,
-            )  # (B*E, k+1, state)
+            )  # (B, k+1, state): rows i .. i+k
             action_seq = torch.cat(
-                [flatten("action", i).unsqueeze(1) for i in range(self.wm_horizon)],
+                [flatten("action", i + 1).unsqueeze(1) for i in range(self.wm_horizon)],
                 dim=1,
-            )  # (B*E, k, action)
+            )  # (B, k, action): rows i+1 .. i+k
             if self.context_names:
                 context = torch.cat([flatten(n, 0) for n in self.context_names], dim=-1)
             else:
@@ -474,7 +477,7 @@ class SuperMimic:
         if needs_history:
             # The stored action at a row is the action that *produced* that row's state, which is
             # exactly the ``last_action`` observation of that frame.
-            keys = keys + ["action"]
+            keys = keys + ["action", self.replay.episode_key]
         batch = self.replay.sample_starts(self.num_imagined, keys, history=history)
         batch = {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
@@ -490,11 +493,41 @@ class SuperMimic:
             "history_action": None,
         }
         if needs_history:
-            start["history_state"] = torch.cat(
-                [batch[n].reshape(self.num_imagined, history, -1) for n in self.state_names], dim=-1
+            start["history_state"], start["history_action"] = self.history_since_episode_start(
+                torch.cat([batch[n].reshape(self.num_imagined, history, -1) for n in self.state_names], dim=-1),
+                batch["action"].reshape(self.num_imagined, history, -1),
+                batch[self.replay.episode_key][:, -1].reshape(-1),
             )
-            start["history_action"] = batch["action"].reshape(self.num_imagined, history, -1)
         return start
+
+    @staticmethod
+    def history_since_episode_start(
+        history_state: torch.Tensor, history_action: torch.Tensor, episode_step: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Make a replayed history window look like the environment's own observation history.
+
+        The replay window is a slice of consecutive rows, so near an episode start it reaches back into
+        the previous episode. The environment's history buffer does not: it restarts at a reset and
+        fills every slot with the reset frame, whose ``last_action`` is zero (the action manager was
+        reset), while the replay stores the action that ended the previous episode on that row.
+
+        Args:
+            history_state: ``(B, H, S)`` replayed states, oldest first.
+            history_action: ``(B, H, A)`` replayed actions aligned with the states.
+            episode_step: ``(B,)`` steps since the reset for the newest frame (0 on the reset frame).
+
+        Returns:
+            The windows with every slot older than the episode replaced by its reset frame, and the
+            action of the reset frame and its copies set to zero.
+        """
+        h = history_state.shape[1]
+        age = torch.arange(h - 1, -1, -1, device=history_state.device)  # age of each slot, newest = 0
+        steps = episode_step.to(history_state.device).long().unsqueeze(1)  # (B, 1)
+        source = (h - 1) - torch.minimum(age.unsqueeze(0), steps)  # (B, H): slot to read
+        state = torch.gather(history_state, 1, source.unsqueeze(-1).expand(-1, -1, history_state.shape[-1]))
+        action = torch.gather(history_action, 1, source.unsqueeze(-1).expand(-1, -1, history_action.shape[-1]))
+        on_reset_frame = (age.unsqueeze(0) >= steps).unsqueeze(-1)  # slots showing the reset frame
+        return state, torch.where(on_reset_frame, torch.zeros_like(action), action)
 
     def _policy_observation(self, state, context, prev_action, ref_index, history_state, history_action):
         """Imagined policy input: the noise-free observation, plus sensor noise, then normalised.
@@ -536,7 +569,7 @@ class SuperMimic:
         return torch.zeros(batch, self.num_actions, device=self.device)
 
     @torch.no_grad()
-    def _imagine(self) -> dict[str, torch.Tensor]:
+    def _imagine(self, start: dict | None = None) -> dict[str, torch.Tensor]:
         """Roll the world model forward under the current policy, without gradients.
 
         This is the data the critic is fit on. The policy gradient is taken in a separate differentiable
@@ -546,12 +579,17 @@ class SuperMimic:
         reward ``r_{t+1}`` and termination ``d_{t+1}`` are evaluated on ``s_{t+1}`` against the
         reference one step later.
 
+        Args:
+            start: Start states in the layout of :meth:`_sample_imagined_starts`; sampled from the
+                replay when None (training). Given explicitly to imagine from chosen states.
+
         Returns:
             ``state`` and ``prev_action`` with ``H + 1`` steps (``s_0 .. s_H`` and the action that
             produced each), ``reward``/``done`` ``(H, B, 1)`` for ``r_1 .. r_H`` / ``d_1 .. d_H``, and
             ``value`` ``(H + 1, B, 1)`` for ``V(s_0) .. V(s_H)``.
         """
-        start = self._sample_imagined_starts()
+        if start is None:
+            start = self._sample_imagined_starts()
         self._bounds = self._state_bounds()
         batch = start["state"].shape[0]
 

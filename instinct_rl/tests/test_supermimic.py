@@ -304,3 +304,53 @@ def test_world_model_fit_is_autoregressive():
         loss = model.rollout_loss(state0, actions, None, targets, update_normalizer=False)["loss"]
     assert torch.isclose(loss, torch.stack(own).mean()), (loss, torch.stack(own).mean())
     assert not torch.isclose(loss, torch.stack(logged).mean())
+
+
+def test_world_model_fit_pairs_each_transition_with_its_own_action():
+    """The world model must be fit on ``(s_t, a_t) -> s_{t+1}``, the pairing imagination uses.
+
+    The toy's joint block integrates the action exactly (``q_{t+1} = q_t + dt * a_t``), so for every
+    fitted window the first transition's joint change must equal ``dt`` times its action.
+    """
+    torch.manual_seed(0)
+    env, algo = _build()
+    recorded = []
+    original = algo.world_model.rollout_loss
+
+    def spy(state0, actions, context, target_states, mask=None, **kwargs):
+        recorded.append((state0.detach(), actions.detach(), target_states.detach(), mask))
+        return original(state0, actions, context, target_states, mask=mask, **kwargs)
+
+    algo.world_model.rollout_loss = spy
+    obs, extras = env.get_observations()
+    for _ in range(12):
+        action = algo.act(obs, extras["observations"])
+        obs, reward, done, infos = env.step(action)
+        extra_obs = infos["observations"]
+        obs = extra_obs["policy"]
+        algo.process_env_step(reward, done, infos, obs, extra_obs)
+    algo._fit_world_model()
+    algo.world_model.rollout_loss = original
+
+    assert recorded, "world-model fit never ran"
+    state0, actions, targets, mask = recorded[0]
+    valid = mask[:, 0].bool()
+    assert bool(valid.any())
+    joint_change = (targets[valid, 0, 4:6] - state0[valid, 4:6]) / env.world.dt
+    assert torch.allclose(joint_change, actions[valid, 0], atol=1e-4), (joint_change - actions[valid, 0]).abs().max()
+
+
+def test_history_window_restarts_at_the_episode_start():
+    """A replayed history must look like the environment's own: frames before the reset are replaced by
+    the reset frame, whose ``last_action`` is zero, exactly as the observation manager fills it."""
+    h = 4
+    states = torch.arange(h, dtype=torch.float32).view(1, h, 1).repeat(3, 1, 1)  # frame t holds value t
+    actions = (torch.arange(h, dtype=torch.float32) + 10).view(1, h, 1).repeat(3, 1, 1)
+    episode_step = torch.tensor([0, 2, 9])  # newest frame is: the reset frame / two steps in / deep in
+    s, a = SuperMimic.history_since_episode_start(states, actions, episode_step)
+    # reset frame newest: every slot shows it, with a zero action
+    assert s[0].flatten().tolist() == [3, 3, 3, 3] and a[0].flatten().tolist() == [0, 0, 0, 0]
+    # two steps after the reset (reset frame = slot 1): older slots repeat it, its action is zero
+    assert s[1].flatten().tolist() == [1, 1, 2, 3] and a[1].flatten().tolist() == [0, 0, 12, 13]
+    # no reset inside the window: unchanged
+    assert s[2].flatten().tolist() == [0, 1, 2, 3] and a[2].flatten().tolist() == [10, 11, 12, 13]
