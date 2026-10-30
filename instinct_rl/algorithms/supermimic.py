@@ -65,7 +65,10 @@ class SuperMimic:
         policy_grad_value_clip: Element-wise clip applied to policy gradients after the global norm
             clip (the paper uses 0.1).
         learning_rate: Kept for the runner's logger; the effective rates live in the learners.
-        save_replay_in_checkpoint: Include the replay buffers in ``state_dict()``.
+        replay_checkpoint: Where the replay buffer (~10 GB at 1000 steps x 4096 envs) is saved.
+            ``"latest"`` (default): only the newest copy, in ``replay_latest.pt`` beside the checkpoints,
+            overwritten at every save; a checkpoint resumes with it when their iterations match.
+            ``"every"``: inside every checkpoint. ``"none"``: not saved.
         fit_terminal_transitions: Also fit the world model on the step that ends an episode. The env
             resets a finished episode inside ``step``, so the state it returns belongs to the next
             episode; the state the episode actually ended in must come from
@@ -115,7 +118,7 @@ class SuperMimic:
         world_model_predict_delta: Sequence[str] | str = "all",
         critic_max_grad_norm: float = 1.0,
         learning_rate: float | None = None,
-        save_replay_in_checkpoint: bool = True,
+        replay_checkpoint: str = "latest",
         fit_terminal_transitions: bool = True,
         final_observation_key: str = "final_observations",
         policy_cuda_graph: bool = False,
@@ -174,7 +177,9 @@ class SuperMimic:
         self.policy_grad_value_clip = policy_grad_value_clip
         self.policy_chunk_size = int(policy_chunk_size)
         self._in_torch_profile = False
-        self.save_replay_in_checkpoint = bool(save_replay_in_checkpoint)
+        if replay_checkpoint not in ("latest", "every", "none"):
+            raise ValueError(f"replay_checkpoint must be 'latest', 'every' or 'none', got {replay_checkpoint!r}")
+        self.replay_checkpoint = replay_checkpoint
         self.fit_terminal_transitions = bool(fit_terminal_transitions)
         self.policy_cuda_graph = bool(policy_cuda_graph)
         self._policy_graph: dict | None = None
@@ -1101,9 +1106,42 @@ class SuperMimic:
             "episode_step": self._episode_step,
             "iteration": self.current_learning_iteration,
         }
-        if self.save_replay_in_checkpoint and self.replay is not None:
+        if self.replay_checkpoint == "every" and self.replay is not None:
             state["replay_state_dict"] = self.replay.state_dict()
         return state
+
+    #: File the newest replay buffer is kept in, beside the checkpoints (``replay_checkpoint="latest"``).
+    REPLAY_FILE = "replay_latest.pt"
+
+    def save_auxiliary(self, directory: str) -> None:
+        """Write the replay buffer to ``<directory>/replay_latest.pt``, replacing the previous one.
+
+        Called by the runner after each checkpoint. Written to a temporary file first, so a crash or a
+        full disk never leaves a truncated replay in place of the last good one.
+        """
+        if self.replay_checkpoint != "latest" or self.replay is None:
+            return
+        path = os.path.join(directory, self.REPLAY_FILE)
+        tmp = path + ".tmp"
+        torch.save({"iteration": self.current_learning_iteration, "replay_state_dict": self.replay.state_dict()}, tmp)
+        os.replace(tmp, path)
+
+    def load_auxiliary(self, directory: str, state: dict) -> None:
+        """Restore the replay from ``replay_latest.pt`` when the checkpoint has none and the file was
+        written at the checkpoint's iteration (an older checkpoint must not get a newer replay)."""
+        if "replay_state_dict" in state or self.replay is None:
+            return
+        path = os.path.join(directory, self.REPLAY_FILE)
+        if not os.path.exists(path):
+            return
+        saved = torch.load(path, weights_only=True, map_location="cpu")
+        if int(saved.get("iteration", -1)) != self.current_learning_iteration:
+            print(
+                f"[SuperMimic] {path} is from iteration {saved.get('iteration')}, the checkpoint from "
+                f"{self.current_learning_iteration}; resuming with an empty replay"
+            )
+            return
+        self.replay.load_state_dict(saved["replay_state_dict"])
 
     def load_state_dict(self, state: dict) -> None:
         required = {"model_state_dict", "world_model", "world_model_optimizer", "policy_optimizer", "critic_optimizer"}

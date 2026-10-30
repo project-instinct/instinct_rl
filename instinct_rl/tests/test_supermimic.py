@@ -214,7 +214,7 @@ def test_supermimic_runs_and_improves_imagined_return(use_critic):
     assert late > early, f"imagined return did not improve: {early:.5f} -> {late:.5f}"
 
 
-def test_supermimic_checkpoint_round_trip():
+def test_supermimic_checkpoint_round_trip(tmp_path):
     torch.manual_seed(0)
     env, algo = _build()
     obs, extras = env.get_observations()
@@ -225,20 +225,34 @@ def test_supermimic_checkpoint_round_trip():
         obs = extra_obs["policy"]
         algo.process_env_step(reward, done, infos, obs, extra_obs)
     algo.update(0)
+    # by default the checkpoint holds no replay; only the newest copy is kept, beside it
     state = algo.state_dict()
-    assert "replay_state_dict" in state
+    assert "replay_state_dict" not in state
+    algo.save_auxiliary(str(tmp_path))
+    assert (tmp_path / SuperMimic.REPLAY_FILE).exists()
 
     _, algo2 = _build()
     algo2.load_state_dict(state)
+    algo2.load_auxiliary(str(tmp_path), state)
     assert torch.equal(next(iter(algo.world_model.parameters())), next(iter(algo2.world_model.parameters())))
     # the trained policy must survive the round trip, or a checkpoint cannot be played or resumed
     for p, q in zip(algo.actor_critic.parameters(), algo2.actor_critic.parameters()):
         assert torch.equal(p, q)
-    assert len(algo2.replay) == len(algo.replay)
+    assert len(algo2.replay) == len(algo.replay) > 0
 
-    torch.save(state, "/tmp/instinct_rl_supermimic_test.pt")
-    loaded = torch.load("/tmp/instinct_rl_supermimic_test.pt", weights_only=True)
-    assert "world_model" in loaded
+    # a checkpoint older than the saved replay resumes with an empty replay rather than a newer one
+    _, algo3 = _build()
+    older = dict(state, iteration=state["iteration"] - 1)
+    algo3.load_state_dict(older)
+    algo3.load_auxiliary(str(tmp_path), older)
+    assert len(algo3.replay) == 0
+
+    # replay_checkpoint="every" keeps the replay inside the checkpoint, as before
+    algo.replay_checkpoint = "every"
+    assert "replay_state_dict" in algo.state_dict()
+    torch.save(algo.state_dict(), tmp_path / "ckpt.pt")
+    loaded = torch.load(tmp_path / "ckpt.pt", weights_only=True)
+    assert "world_model" in loaded and "replay_state_dict" in loaded
 
 
 if __name__ == "__main__":

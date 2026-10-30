@@ -490,6 +490,9 @@ class OnPolicyRunner:
             }
         )
         torch.save(run_state_dict, path)
+        # state an algorithm keeps outside the checkpoint (e.g. the newest replay buffer only)
+        if hasattr(self.alg, "save_auxiliary"):
+            self.alg.save_auxiliary(os.path.dirname(os.path.abspath(path)))
 
     def load(self, path):
         """Load training state dict from file. (even for multi-processes)"""
@@ -513,6 +516,8 @@ class OnPolicyRunner:
                 print("\033[1;36m Done: using a hacky way to load the model. \033[0m")
 
         self.alg.load_state_dict(loaded_dict)
+        if hasattr(self.alg, "load_auxiliary"):
+            self.alg.load_auxiliary(os.path.dirname(os.path.abspath(path)), loaded_dict)
 
         for group_name, normalizer in self.normalizers.items():
             if f"{group_name}_normalizer_state_dict" not in loaded_dict:
