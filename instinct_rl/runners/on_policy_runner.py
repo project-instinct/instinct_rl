@@ -68,9 +68,7 @@ def _resolve_algorithm_inputs(inputs, env, obs_format) -> dict:
     resolved = {}
     for name, spec in inputs.items():
         if ":" not in spec:
-            raise ValueError(
-                f"algorithm input {name!r} must be 'module.path:factory', got {spec!r}"
-            )
+            raise ValueError(f"algorithm input {name!r} must be 'module.path:factory', got {spec!r}")
         module_name, factory_name = spec.split(":", 1)
         factory = getattr(importlib.import_module(module_name), factory_name)
         resolved[name] = factory(env=env, obs_format=obs_format)
@@ -446,12 +444,14 @@ class OnPolicyRunner:
                 f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
                     'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
             )
+            # every loss is printed above under its own name; algorithms other than PPO have no
+            # ``value_loss`` / ``surrogate_loss``
             for k, v in locs["losses"].items():
                 log_string += f"""{k:>{pad}} {v.item():.4f}\n"""
             log_string += (
-                f"""{'Value function loss:':>{pad}} {locs["losses"]['value_loss']:.4f}\n"""
-                f"""{'Surrogate loss:':>{pad}} {locs["losses"]['surrogate_loss']:.4f}\n"""
-                + (f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n""" if mean_std is not None else "")
+                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+                if mean_std is not None
+                else ""
                 # f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
                 # f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n"""
             )
