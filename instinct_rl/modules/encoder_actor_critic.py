@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 import instinct_rl.modules as instinct_modules
-from instinct_rl.utils.utils import get_subobs_size
+from instinct_rl.utils.utils import get_obs_slice, get_subobs_size
 
 
 class EncoderActorCriticMixin:
@@ -21,10 +21,18 @@ class EncoderActorCriticMixin:
         num_actions,
         encoder_configs: Dict[str, dict],
         critic_encoder_configs=None,  # None, "shared", or an ordereddict of configs (in the same order as encoder_configs)
+        reference_residual: dict | None = None,
         **kwargs,
     ):
         """NOTE: recurrent encoder is not implemented and tested yet.
         Args:
+            reference_residual: Make the actor output a correction on top of a reference read from the
+                policy observation (InstantTrack's reference-residual policy): ``{"component": name,
+                "frame": k, "scale": [num_actions floats]}`` adds ``scale * obs[name][k]`` to the action,
+                with ``obs[name]`` a ``(frames, num_actions)`` component taken in raw (un-normalised) units.
+                For a joint-position action ``q_default + alpha * a`` and a component holding
+                ``q_ref - q_default``, ``scale = 1 / alpha`` makes the untrained policy command the
+                reference. Only the deterministic action (``act_inference``) supports it.
         """
         self.__obs_segments = obs_format["policy"]
         self.__critic_obs_segments = obs_format.get("critic", obs_format["policy"])
@@ -82,16 +90,57 @@ class EncoderActorCriticMixin:
         self.encoder_latents_buf = dict()
         self.critic_encoder_latents_buf = dict()
 
+        self.reference_residual = reference_residual
+        if reference_residual is not None:
+            component_slice, shape = get_obs_slice(self.__obs_segments, reference_residual["component"])
+            if len(shape) != 2 or shape[-1] != num_actions:
+                raise ValueError(
+                    f"reference_residual component {reference_residual['component']!r} has shape {shape}, expected"
+                    f" (frames, {num_actions})"
+                )
+            frame = int(reference_residual["frame"])
+            if not 0 <= frame < shape[0]:
+                raise ValueError(f"reference_residual frame {frame} is outside the component's {shape[0]} frames")
+            start = int(component_slice.start) + frame * num_actions
+            self._reference_slice = slice(start, start + num_actions)
+            scale = torch.as_tensor(reference_residual["scale"], dtype=torch.float32)
+            if scale.shape != (num_actions,):
+                raise ValueError(f"reference_residual scale has shape {tuple(scale.shape)}, expected ({num_actions},)")
+            self.register_buffer("reference_residual_scale", scale)
+        # The policy-group normaliser the observations arrive scaled by (see ``set_policy_obs_normalizer``).
+        self.policy_obs_normalizer = None
+
+    def set_policy_obs_normalizer(self, normalizer):
+        """Name the normaliser the actor's observations were scaled with, so ``reference_residual`` can read
+        its component in raw units. Held by reference and not registered as a submodule: the runner saves
+        its state, and it may be moved to another device after this call."""
+        object.__setattr__(self, "policy_obs_normalizer", normalizer)
+
+    def reference_action(self, observations):
+        """``scale * obs[component][frame]`` of ``reference_residual``, in raw observation units."""
+        reference = observations[..., self._reference_slice]
+        normalizer = self.policy_obs_normalizer
+        if normalizer is not None:
+            mean = normalizer._mean[..., self._reference_slice]
+            std = normalizer._std[..., self._reference_slice]
+            reference = reference * (std + normalizer.eps) + mean
+        return reference * self.reference_residual_scale
+
     def backbone_act(self, flatten_observations, **kwargs):
         super().act(flatten_observations, **kwargs)
 
     def act(self, observations, **kwargs):
+        if self.reference_residual is not None:
+            raise NotImplementedError("reference_residual shifts the deterministic action only; act() samples")
         obs = self.encoders(observations)
         return super().act(obs, **kwargs)
 
     def act_inference(self, observations):
         obs = self.encoders(observations)
-        return super().act_inference(obs)
+        actions = super().act_inference(obs)
+        if self.reference_residual is not None:
+            actions = actions + self.reference_action(observations)
+        return actions
 
     def backbone_evaluate(self, flatten_observations, masks=None, hidden_states=None):
         """Evaluate the model with the backbone input, which is typically an MLP."""
@@ -118,6 +167,11 @@ class EncoderActorCriticMixin:
         """Export the model as an ONNX file. Input should be batch-wise observations with batchsize 1."""
         self.eval()
         if encoder_as_seperate_file:
+            if self.reference_residual is not None:
+                raise NotImplementedError(
+                    "reference_residual adds to the action outside the encoder and the backbone; export with"
+                    " encoder_as_seperate_file=False"
+                )
             self.encoders.export_as_onnx(observations, filedir, encoder_as_seperate_file)
             with torch.no_grad():
                 obs = self.encoders(observations)

@@ -126,6 +126,9 @@ class OnPolicyRunner:
         # itself, and they must be scaled exactly like the real ones
         if hasattr(self.alg, "set_normalizers"):
             self.alg.set_normalizers(self.normalizers)
+        # a reference-residual actor reads part of its (normalised) input back in raw units
+        if hasattr(self.alg.actor_critic, "set_policy_obs_normalizer"):
+            self.alg.actor_critic.set_policy_obs_normalizer(self.normalizers.get("policy"))
 
         # init storage and model
         self.alg.init_storage(

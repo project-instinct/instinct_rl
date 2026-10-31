@@ -85,6 +85,12 @@ class SuperMimic:
             and the state integration stay float32. ``None`` (default) keeps float32 throughout.
             Collection (:meth:`act`) is unaffected. float16 is not offered: its range needs loss
             scaling, whose host-side overflow check does not fit the captured graphs.
+        policy_ema_decay: Keep a Polyak average of the policy weights, updated after every policy step
+            with this decay (InstantTrack uses 0.995). Checkpoints then store the average as
+            ``model_state_dict`` (what evaluation, play and export load) and the trained weights as
+            ``model_state_dict_live``. Collection and imagination use the trained weights. ``None``
+            (default) keeps no average.
+        fused_optimizers: Use the fused CUDA kernels of the three Adam optimisers.
     """
 
     #: Observation group carrying the simulation context.
@@ -129,6 +135,8 @@ class SuperMimic:
         policy_cuda_graph: bool = False,
         world_model_cuda_graph: bool = False,
         mixed_precision: str | None = None,
+        policy_ema_decay: float | None = None,
+        fused_optimizers: bool = False,
         device: str | torch.device = "cpu",
         **kwargs,
     ):
@@ -211,10 +219,13 @@ class SuperMimic:
         self._bounds: tuple[torch.Tensor, torch.Tensor] | None = None
 
         self._world_model_learning_rate = float(world_model_learning_rate)
+        self._adam_kwargs = {"fused": True} if fused_optimizers else {}
         self.world_model_optimizer = (
             None
             if self.world_model is None
-            else torch.optim.Adam(self.world_model.parameters(), lr=self._world_model_learning_rate)
+            else torch.optim.Adam(
+                self.world_model.parameters(), lr=self._world_model_learning_rate, **self._adam_kwargs
+            )
         )
         # The critic is the ``critic`` head plus a critic-only encoder if the model has one; the policy is
         # every other parameter. Selecting ``actor`` alone would leave an actor-side encoder untrained.
@@ -228,8 +239,14 @@ class SuperMimic:
         self.policy_params = [p for p in self.actor_critic.parameters() if id(p) not in critic_ids]
         self.critic_params = critic_params
         # paper Table A.5: Adam with beta = (0.9, 0.95) for the policy
-        self.policy_optimizer = torch.optim.Adam(self.policy_params, lr=policy_learning_rate, betas=(0.9, 0.95))
-        self.critic_optimizer = torch.optim.Adam(critic_params, lr=critic_learning_rate)
+        self.policy_optimizer = torch.optim.Adam(
+            self.policy_params, lr=policy_learning_rate, betas=(0.9, 0.95), **self._adam_kwargs
+        )
+        self.critic_optimizer = torch.optim.Adam(critic_params, lr=critic_learning_rate, **self._adam_kwargs)
+        self.policy_ema_decay = None if policy_ema_decay is None else float(policy_ema_decay)
+        # the averaged policy weights, in ``policy_params`` order, with their ``state_dict`` names
+        self._policy_param_names = [n for n, p in self.actor_critic.named_parameters() if id(p) not in critic_ids]
+        self.policy_ema = None if self.policy_ema_decay is None else [p.detach().clone() for p in self.policy_params]
 
         self.world_model_max_grad_norm = world_model_max_grad_norm
         self.policy_max_grad_norm = policy_max_grad_norm
@@ -290,7 +307,7 @@ class SuperMimic:
                 **self._world_model_cfg,
             ).to(self.device)
             self.world_model_optimizer = torch.optim.Adam(
-                self.world_model.parameters(), lr=self._world_model_learning_rate
+                self.world_model.parameters(), lr=self._world_model_learning_rate, **self._adam_kwargs
             )
 
     @staticmethod
@@ -982,6 +999,11 @@ class SuperMimic:
         if self.policy_grad_value_clip is not None:
             nn.utils.clip_grad_value_(self.policy_params, self.policy_grad_value_clip)
         self.policy_optimizer.step()
+        if self.policy_ema is not None:
+            with torch.no_grad():
+                torch._foreach_lerp_(
+                    self.policy_ema, [p.detach() for p in self.policy_params], 1.0 - self.policy_ema_decay
+                )
         # ``policy_return`` includes the critic's bootstrap, so it also moves as the critic learns;
         # ``imagined_reward`` is the H-step reward part alone, which only the policy changes.
         # ``imagined_survival`` is the mean survival weight c_H at the horizon.
@@ -1132,10 +1154,20 @@ class SuperMimic:
     def distributed_data_parallel(self):
         return None
 
+    def _averaged_model_state_dict(self) -> dict:
+        """The actor-critic's state dict with the averaged policy weights in place of the trained ones."""
+        state = self.actor_critic.state_dict()
+        for name, value in zip(self._policy_param_names, self.policy_ema):
+            state[name] = value.clone()
+        return state
+
     def state_dict(self) -> dict:
         state = {
-            # the policy and critic, under the key PPO uses, so play/export scripts find them
-            "model_state_dict": self.actor_critic.state_dict(),
+            # the policy and critic, under the key PPO uses, so play/export scripts find them; with a policy
+            # average that is the average, and the trained weights are kept for resuming
+            "model_state_dict": (
+                self.actor_critic.state_dict() if self.policy_ema is None else self._averaged_model_state_dict()
+            ),
             "world_model": self.world_model.state_dict(),
             "world_model_optimizer": self.world_model_optimizer.state_dict(),
             "policy_optimizer": self.policy_optimizer.state_dict(),
@@ -1143,6 +1175,8 @@ class SuperMimic:
             "episode_step": self._episode_step,
             "iteration": self.current_learning_iteration,
         }
+        if self.policy_ema is not None:
+            state["model_state_dict_live"] = self.actor_critic.state_dict()
         if self.replay_checkpoint == "every" and self.replay is not None:
             state["replay_state_dict"] = self.replay.state_dict()
         return state
@@ -1185,7 +1219,13 @@ class SuperMimic:
         missing = required - set(state)
         if missing:
             raise KeyError(f"checkpoint is missing SuperMimic entries: {sorted(missing)}")
-        self.actor_critic.load_state_dict(state["model_state_dict"])
+        # ``model_state_dict`` holds the policy average when one was kept; training resumes from the trained
+        # weights and continues the average from the stored one
+        self.actor_critic.load_state_dict(state.get("model_state_dict_live", state["model_state_dict"]))
+        if self.policy_ema is not None:
+            averaged = state["model_state_dict"]
+            for value, name in zip(self.policy_ema, self._policy_param_names):
+                value.copy_(averaged[name])
         self.world_model.load_state_dict(state["world_model"])
         self.world_model_optimizer.load_state_dict(state["world_model_optimizer"])
         self.policy_optimizer.load_state_dict(state["policy_optimizer"])

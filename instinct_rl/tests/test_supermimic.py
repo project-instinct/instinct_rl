@@ -34,6 +34,7 @@ def _build(
     wm_batches=2,
     device=DEVICE,
     mixed_precision=None,
+    policy_ema_decay=None,
 ):
     env = FakeVecEnv(num_envs=num_envs, episode_length=16, device=device)
     actor_critic = ActorCritic(
@@ -69,6 +70,7 @@ def _build(
         wm_warmup_iterations=warmup,
         collection_noise_std=0.1,
         mixed_precision=mixed_precision,
+        policy_ema_decay=policy_ema_decay,
         device=device,
     )
     algo.init_storage(env.num_envs, 5, OBS_FORMAT, NUM_ACTIONS, num_rewards=1)
@@ -535,3 +537,89 @@ def test_mixed_precision_keeps_the_imagined_state_float32():
         assert value.dtype == torch.float32, name
     with pytest.raises(ValueError):
         _build(mixed_precision="float16")
+
+
+def test_policy_average_is_what_checkpoints_store():
+    """With a policy EMA the checkpoint's ``model_state_dict`` is the average (what evaluation loads) and a
+    resumed run continues from the trained weights and the stored average."""
+    torch.manual_seed(0)
+    env, algo = _build(policy_ema_decay=0.9)
+    obs, extras = env.get_observations()
+    for iteration in range(4):
+        for _ in range(5):
+            action = algo.act(obs, extras["observations"])
+            obs, reward, done, infos = env.step(action)
+            extra_obs = infos["observations"]
+            obs = extra_obs["policy"]
+            algo.process_env_step(reward, done, infos, obs, extra_obs)
+        before = [p.detach().clone() for p in algo.policy_params]
+        average = [e.clone() for e in algo.policy_ema]
+        losses, _ = algo.update(iteration)
+        if "imagined_reward" not in losses:
+            continue
+        # each policy step moves the average 10% of the way to the new weights
+        for e_old, e_new, p_new in zip(average, algo.policy_ema, algo.policy_params):
+            assert torch.allclose(e_new, 0.9 * e_old + 0.1 * p_new.detach(), atol=1e-6)
+        assert any(not torch.equal(b, p) for b, p in zip(before, algo.policy_params)), "no policy step was taken"
+
+    state = algo.state_dict()
+    names = dict(algo.actor_critic.named_parameters())
+    for name, e in zip(algo._policy_param_names, algo.policy_ema):
+        assert torch.equal(state["model_state_dict"][name], e)
+        assert torch.equal(state["model_state_dict_live"][name], names[name].detach())
+    assert any(
+        not torch.equal(state["model_state_dict"][n], state["model_state_dict_live"][n])
+        for n in algo._policy_param_names
+    )
+
+    _, resumed = _build(policy_ema_decay=0.9)
+    resumed.load_state_dict(state)
+    for p, q in zip(algo.policy_params, resumed.policy_params):
+        assert torch.equal(p, q)
+    for e, f in zip(algo.policy_ema, resumed.policy_ema):
+        assert torch.equal(e, f)
+
+
+def test_reference_residual_adds_the_raw_reference():
+    """The actor adds ``scale * obs[component][frame]`` in raw units, whatever the normaliser does to it."""
+    from collections import OrderedDict
+
+    from instinct_rl.modules import EncoderActorCritic
+    from instinct_rl.modules.normalizer import EmpiricalNormalization
+
+    torch.manual_seed(0)
+    num_actions = 3
+    segments = OrderedDict(proprio=(4,), joint_ref=(2, num_actions))
+    scale = [2.0, 0.5, -1.0]
+    model = EncoderActorCritic(
+        obs_format={"policy": segments},
+        num_actions=num_actions,
+        encoder_configs={
+            "motion": {
+                "class_name": "MlpModel",
+                "component_names": ["joint_ref"],
+                "output_size": 4,
+                "takeout_input_components": True,
+                "hidden_sizes": [8],
+                "nonlinearity": "ELU",
+            }
+        },
+        actor_hidden_dims=[16],
+        critic_hidden_dims=[16],
+        activation="elu",
+        reference_residual={"component": "joint_ref", "frame": 1, "scale": scale},
+    )
+    normalizer = EmpiricalNormalization(shape=[10])
+    normalizer.update(3.0 * torch.randn(256, 10) + 1.0)
+    model.set_policy_obs_normalizer(normalizer)
+
+    raw = torch.randn(5, 10)
+    obs = normalizer.normalize(raw)
+    reference = raw[:, 4 + num_actions : 4 + 2 * num_actions]  # frame 1 of joint_ref, after the 4 proprio values
+    from instinct_rl.modules import ActorCritic
+
+    backbone = ActorCritic.act_inference(model, model.encoders(obs))
+    assert torch.allclose(model.act_inference(obs), backbone + reference * torch.tensor(scale), atol=1e-5)
+    assert "reference_residual_scale" in model.state_dict()
+    with pytest.raises(NotImplementedError):
+        model.act(obs)
