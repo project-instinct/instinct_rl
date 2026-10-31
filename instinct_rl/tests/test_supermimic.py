@@ -33,6 +33,7 @@ def _build(
     num_envs=16,
     wm_batches=2,
     device=DEVICE,
+    mixed_precision=None,
 ):
     env = FakeVecEnv(num_envs=num_envs, episode_length=16, device=device)
     actor_critic = ActorCritic(
@@ -67,6 +68,7 @@ def _build(
         updates_per_iteration=1,
         wm_warmup_iterations=warmup,
         collection_noise_std=0.1,
+        mixed_precision=mixed_precision,
         device=device,
     )
     algo.init_storage(env.num_envs, 5, OBS_FORMAT, NUM_ACTIONS, num_rewards=1)
@@ -181,13 +183,13 @@ def test_replay_windows_are_contiguous_and_checkpointable():
     assert torch.equal(r._buffers["s"], r2._buffers["s"])
 
 
-@pytest.mark.parametrize("use_critic", [True, False])
-def test_supermimic_runs_and_improves_imagined_return(use_critic):
+@pytest.mark.parametrize("use_critic,mixed_precision", [(True, None), (False, None), (True, "bfloat16")])
+def test_supermimic_runs_and_improves_imagined_return(use_critic, mixed_precision):
     # The world model gets a real fitting budget and a warm start: improving an imagined return only
     # means something when the model it is imagined in describes the dynamics. ``use_critic=False`` is
     # the paper's critic ablation: the policy bootstraps with zero and no critic is fitted.
     torch.manual_seed(0)
-    env, algo = _build(warmup=5, wm_batches=20, use_critic=use_critic)
+    env, algo = _build(warmup=5, wm_batches=20, use_critic=use_critic, mixed_precision=mixed_precision)
     obs, extras = env.get_observations()
 
     returns = []
@@ -430,11 +432,12 @@ def test_replay_keeps_the_state_an_episode_ended_in():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-def test_graphed_policy_pass_matches_eager():
+@pytest.mark.parametrize("mixed_precision", [None, "bfloat16"])
+def test_graphed_policy_pass_matches_eager(mixed_precision):
     """The CUDA-graph replay of a policy chunk must give the eager pass's gradients and outputs, also
     for later updates whose start states differ from the ones the graph was captured with."""
     torch.manual_seed(0)
-    env, algo = _build(device="cuda", num_imagined=64)
+    env, algo = _build(device="cuda", num_imagined=64, mixed_precision=mixed_precision)
     obs, extras = env.get_observations()
     for _ in range(12):
         action = algo.act(obs, extras["observations"])
@@ -473,10 +476,11 @@ def test_graphed_policy_pass_matches_eager():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
-def test_graphed_world_model_fit_matches_eager():
+@pytest.mark.parametrize("mixed_precision", [None, "bfloat16"])
+def test_graphed_world_model_fit_matches_eager(mixed_precision):
     """The CUDA-graph replay of a world-model batch gives the eager loss and gradients, on new data too."""
     torch.manual_seed(0)
-    env, algo = _build(device="cuda")
+    env, algo = _build(device="cuda", mixed_precision=mixed_precision)
     obs, extras = env.get_observations()
     for _ in range(12):
         action = algo.act(obs, extras["observations"])
@@ -497,7 +501,8 @@ def test_graphed_world_model_fit_matches_eager():
         for p in params:  # zeroed in place: the graph holds these gradient tensors
             if p.grad is not None:
                 p.grad.zero_()
-        loss = wm.rollout_loss(*batch[:4], mask=mask, update_normalizer=False)["loss"]
+        with algo._autocast():
+            loss = wm.rollout_loss(*batch[:4], mask=mask, update_normalizer=False)["loss"]
         loss.backward()
         eager = loss.detach().clone()
         del loss  # a live autograd graph would tie the capture to the default stream
@@ -507,3 +512,26 @@ def test_graphed_world_model_fit_matches_eager():
         for e, p in zip(expected, params):
             assert torch.allclose(e, p.grad, rtol=1e-4, atol=1e-6)
         algo.world_model_optimizer.step()  # the graph must read the updated weights next time
+
+
+def test_mixed_precision_keeps_the_imagined_state_float32():
+    """Under bfloat16 only the network passes are reduced: the imagined trajectory the critic is fit on,
+    the rewards and the world model's states stay float32."""
+    torch.manual_seed(0)
+    env, algo = _build(mixed_precision="bfloat16")
+    obs, extras = env.get_observations()
+    for _ in range(12):
+        action = algo.act(obs, extras["observations"])
+        obs, reward, done, infos = env.step(action)
+        extra_obs = infos["observations"]
+        obs = extra_obs["policy"]
+        algo.process_env_step(reward, done, infos, obs, extra_obs)
+    algo._begin_imagination()
+    with algo._autocast():
+        assert algo.world_model.net(torch.zeros(1, algo.world_model.net.model[0].in_features)).dtype == torch.bfloat16
+    out = algo._imagined_return(torch.arange(16), keep_trajectory=True)
+    assert out[0].dtype == torch.float32
+    for name, value in out[3].items():
+        assert value.dtype == torch.float32, name
+    with pytest.raises(ValueError):
+        _build(mixed_precision="float16")

@@ -313,17 +313,22 @@ class WorldModel(nn.Module):
         context: torch.Tensor | None = None,
         update_normalizer: bool = False,
     ) -> torch.Tensor:
-        """Predict the next state (in the state layout). Leading dims are preserved."""
-        x = self._concat(state, action, context)
-        x = _apply_normalizer(self.input_normalizer, x, update=update_normalizer)
+        """Predict the next state (in the state layout). Leading dims are preserved.
+
+        Under a caller's autocast only the MLP runs in reduced precision; the features, normalisers and
+        the state integration (including quaternion renormalisation) stay float32.
+        """
+        full_precision = torch.autocast(state.device.type, enabled=False)
+        with full_precision:
+            x = self._concat(state, action.float(), context)
+            x = _apply_normalizer(self.input_normalizer, x, update=update_normalizer)
         if self.matmul_dtype is not None:
             x = x.to(self.matmul_dtype)
-        prediction = self.net(x)
-        if self.matmul_dtype is not None:
-            prediction = prediction.float()
-        if self.output_normalizer is not None:
-            prediction = self.output_normalizer.inverse(prediction)
-        return self.parameterization.integrate(state.reshape(*state.shape[:-1], self.state_size), prediction)
+        prediction = self.net(x).float()
+        with full_precision:
+            if self.output_normalizer is not None:
+                prediction = self.output_normalizer.inverse(prediction)
+            return self.parameterization.integrate(state.reshape(*state.shape[:-1], self.state_size), prediction)
 
     def rollout(
         self,

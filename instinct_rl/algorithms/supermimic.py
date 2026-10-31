@@ -80,6 +80,11 @@ class SuperMimic:
             launches. Needs a CUDA device and a batch that is a multiple of ``policy_chunk_size``.
         world_model_cuda_graph: Likewise replay each world-model batch's k-step loss and backward as a
             captured CUDA graph (the normaliser statistics are updated outside it).
+        mixed_precision: ``"bfloat16"`` runs the learner's network passes (world model, policy and
+            critic, forward and backward) under autocast; weights, optimisers, rewards, terminations
+            and the state integration stay float32. ``None`` (default) keeps float32 throughout.
+            Collection (:meth:`act`) is unaffected. float16 is not offered: its range needs loss
+            scaling, whose host-side overflow check does not fit the captured graphs.
     """
 
     #: Observation group carrying the simulation context.
@@ -123,6 +128,7 @@ class SuperMimic:
         final_observation_key: str = "final_observations",
         policy_cuda_graph: bool = False,
         world_model_cuda_graph: bool = False,
+        mixed_precision: str | None = None,
         device: str | torch.device = "cpu",
         **kwargs,
     ):
@@ -186,6 +192,9 @@ class SuperMimic:
         self.world_model_cuda_graph = bool(world_model_cuda_graph)
         self._world_model_graph: dict | None = None
         self.final_observation_key = str(final_observation_key)
+        if mixed_precision not in (None, "bfloat16"):
+            raise ValueError(f"mixed_precision must be None or 'bfloat16', got {mixed_precision!r}")
+        self.amp_dtype = None if mixed_precision is None else torch.bfloat16
         # The runner logs `alg.learning_rate`; report the policy rate as the headline number.
         self.learning_rate = float(policy_learning_rate if learning_rate is None else learning_rate)
 
@@ -299,6 +308,24 @@ class SuperMimic:
     def set_normalizers(self, normalizers):
         """Runner hook: keep the normalisers where the imagination can reach them."""
         self.normalizers = dict(normalizers or {})
+
+    def _autocast(self):
+        """Autocast context for the learner's network passes (a no-op without ``mixed_precision``).
+
+        The cast-weight cache is off: inside a captured CUDA graph a cached cast would be a stale copy
+        of the weights the optimiser updates in place.
+        """
+        return torch.autocast(
+            device_type=self.device.type,
+            dtype=self.amp_dtype or torch.bfloat16,
+            enabled=self.amp_dtype is not None,
+            cache_enabled=False,
+        )
+
+    def _policy_action(self, obs: torch.Tensor) -> torch.Tensor:
+        """Deterministic policy action on an imagined observation, as float32."""
+        with self._autocast():
+            return self.actor_critic.act_inference(obs).float()
 
     def _normalize(self, group: str, obs: torch.Tensor) -> torch.Tensor:
         """Apply the runner's normaliser for this group, without updating its statistics.
@@ -585,7 +612,8 @@ class SuperMimic:
                 loss = self._graphed_world_model_loss(batch)
             else:
                 self.world_model_optimizer.zero_grad(set_to_none=True)
-                loss = self.world_model.rollout_loss(batch[0], batch[1], batch[2], batch[3], mask=batch[4])["loss"]
+                with self._autocast():
+                    loss = self.world_model.rollout_loss(batch[0], batch[1], batch[2], batch[3], mask=batch[4])["loss"]
                 loss.backward()
             if self.world_model_max_grad_norm is not None:
                 nn.utils.clip_grad_norm_(self.world_model.parameters(), self.world_model_max_grad_norm)
@@ -605,9 +633,10 @@ class SuperMimic:
             def run():
                 for p in params:
                     p.grad.zero_()
-                loss = self.world_model.rollout_loss(
-                    inputs[0], inputs[1], inputs[2], inputs[3], mask=inputs[4], update_normalizer=False
-                )["loss"]
+                with self._autocast():
+                    loss = self.world_model.rollout_loss(
+                        inputs[0], inputs[1], inputs[2], inputs[3], mask=inputs[4], update_normalizer=False
+                    )["loss"]
                 loss.backward()
                 return loss.detach()
 
@@ -719,7 +748,8 @@ class SuperMimic:
         if not self.use_critic:
             return torch.zeros(state.shape[0], 1, device=self.device)
         obs = self.imagination.critic_obs(state, context, ref_index, prev_action)
-        return self.actor_critic.evaluate(self._normalize("critic", obs))
+        with self._autocast():
+            return self.actor_critic.evaluate(self._normalize("critic", obs)).float()
 
     def _rows(self, idx: torch.Tensor):
         """The held rollout starts restricted to the batch rows ``idx``."""
@@ -778,8 +808,10 @@ class SuperMimic:
 
         states, prev_actions, rewards, dones = [state], [prev_action], [], []
         for _ in range(self.horizon):
-            action = self.actor_critic.act_inference(obs)
-            next_state = self._clamp_state(self.world_model(state, action, context), self._bounds)
+            action = self._policy_action(obs)
+            with self._autocast():
+                next_state = self.world_model(state, action, context)
+            next_state = self._clamp_state(next_state, self._bounds)
             ref_index = self.imagination.advance(ref_index)
             rewards.append(self.imagination.reward(next_state, action, prev_action, ref_index).sum(-1, keepdim=True))
             dones.append(self.imagination.termination_prob(next_state, ref_index))
@@ -861,7 +893,8 @@ class SuperMimic:
             if normalizer is not None:
                 normalizer.update(obs.reshape(steps * batch, -1))
             obs = self._normalize("critic", obs)
-            values = self.actor_critic.evaluate(obs.reshape(steps * batch, -1)).reshape(steps, batch, 1)
+            with self._autocast():
+                values = self.actor_critic.evaluate(obs.reshape(steps * batch, -1)).float().reshape(steps, batch, 1)
             targets, _ = compute_gae(rollout["reward"], values[:-1], rollout["done"], values[-1], self.gamma, self.lam)
         inputs = obs[:-1].reshape((steps - 1) * batch, -1)
         targets = targets.reshape((steps - 1) * batch, 1)
@@ -875,7 +908,9 @@ class SuperMimic:
             perm = torch.randperm(rows, device=self.device)
             for begin in range(0, rows - mini + 1, mini):
                 idx = perm[begin : begin + mini]
-                loss = ((self.actor_critic.evaluate(inputs[idx]) - targets[idx]) ** 2).mean()
+                with self._autocast():
+                    value = self.actor_critic.evaluate(inputs[idx]).float()
+                loss = ((value - targets[idx]) ** 2).mean()
                 self.critic_optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 if self.critic_max_grad_norm is not None:
@@ -1056,9 +1091,11 @@ class SuperMimic:
         states, prev_actions, rewards, dones = [state.detach()], [prev_action.detach()], [], []
         for _ in range(self.horizon):
             with record("sm_actor"):
-                action = self.actor_critic.act_inference(obs)
+                action = self._policy_action(obs)
             with record("sm_world_model"):
-                next_state = self._clamp_state(self.world_model(state, action, context), self._bounds)
+                with self._autocast():
+                    next_state = self.world_model(state, action, context)
+                next_state = self._clamp_state(next_state, self._bounds)
             with record("sm_reward_termination"):
                 ref_index = self.imagination.advance(ref_index)
                 reward = self.imagination.reward(next_state, action, prev_action, ref_index).sum(dim=-1)
