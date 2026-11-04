@@ -192,6 +192,14 @@ class PlannerAlgoMixin:
         )
 
     def act(self, obs, extra_obs):
+        return super().act(self.compose_policy_obs(obs, extra_obs, target_noise=True), extra_obs)
+
+    def compose_policy_obs(self, obs, extra_obs, target_noise: bool) -> torch.Tensor:
+        """The (normalized) policy obs with the planner's targets in the target slot where the gate is set.
+
+        Also records the planner's decoded targets for :meth:`get_policy_feedback`. ``target_noise`` adds
+        ``planner_target_noise`` (training); playback and evaluation pass False.
+        """
         gate = extra_obs[self.planner_gate_group]
         with torch.no_grad():
             positions, occupied = self.planner.predict(extra_obs[self.planner_obs_group])
@@ -200,7 +208,7 @@ class PlannerAlgoMixin:
             self.planner_occupancy_feedback_key: occupied.float(),
         }
         targets = positions.reshape(positions.shape[0], -1)
-        if self.planner_target_noise > 0.0:
+        if target_noise and self.planner_target_noise > 0.0:
             targets = targets + (2.0 * torch.rand_like(targets) - 1.0) * self.planner_target_noise
         if self.policy_normalizer is not None:
             index = self._target_index
@@ -209,7 +217,7 @@ class PlannerAlgoMixin:
             )
         composed = obs.clone()
         composed[:, self._target_index] = torch.where(gate > 0.5, targets, obs[:, self._target_index])
-        return super().act(composed, extra_obs)
+        return composed
 
     def get_policy_feedback(self) -> dict[str, torch.Tensor]:
         """Runner hook (sent to the env before its step): the planner's decoded targets of the last ``act``."""
