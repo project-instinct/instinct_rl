@@ -191,3 +191,106 @@ class FakeVecEnv:
             done.float(),
             infos,
         )
+
+
+class FakeContactPlannerEnv:
+    """Toy env with the observation groups of a contact-planner task (ACP stage 2).
+
+    Groups: ``policy`` and ``critic`` (``proprio`` (4,) and the env's own ``contact_targets`` (Q * 3,), always
+    ``REFERENCE_TARGET``), ``planner`` (``points_xy`` (rows, cols, 2), ``points_z`` (rows, cols), ``proprio`` (4,))
+    and ``contact_source`` (``gate`` (1,), 1 with probability ``gate_probability``).
+
+    Labels follow a learnable rule: body q's next contact is the terrain point with the q-th highest height, and it
+    has one when ``proprio[q] > 0``. Every step, the observations of the current step are sent back as labeled
+    samples in ``infos["planner_samples"]``. ``set_policy_feedback`` / ``set_training_iteration`` record what the
+    runner sends.
+    """
+
+    GRID = (3, 4)
+    NUM_BODIES = 2
+    REFERENCE_TARGET = 5.0
+
+    def __init__(self, num_envs=16, episode_length=10, gate_probability=0.5, seed=0, device="cpu"):
+        self.num_envs = int(num_envs)
+        self.num_rewards = 1
+        self.num_actions = NUM_ACTIONS
+        self.max_episode_length = int(episode_length)
+        self.device = torch.device(device)
+        self.gate_probability = float(gate_probability)
+        self.generator = torch.Generator().manual_seed(seed)
+        self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.feedback_history = []
+        self.iteration_history = []
+        rows, cols = self.GRID
+        grid_x, grid_y = torch.meshgrid(
+            torch.linspace(-0.8, 0.8, cols), torch.linspace(-0.5, 0.5, rows), indexing="xy"
+        )  # (rows, cols)
+        self.points_xy = torch.stack([grid_x, grid_y], dim=-1).to(self.device)
+        self._sample_obs()
+
+    def get_obs_format(self):
+        rows, cols = self.GRID
+        actor = OrderedDict({"proprio": (4,), "contact_targets": (self.NUM_BODIES * 3,)})
+        return {
+            "policy": actor,
+            "critic": OrderedDict(actor),
+            "planner": OrderedDict({"points_xy": (rows, cols, 2), "points_z": (rows, cols), "proprio": (4,)}),
+            "contact_source": OrderedDict({"gate": (1,)}),
+        }
+
+    def _sample_obs(self):
+        rows, cols = self.GRID
+        self.points_z = torch.rand(self.num_envs, rows, cols, generator=self.generator).to(self.device) * 0.5
+        self.proprio = torch.randn(self.num_envs, 4, generator=self.generator).to(self.device)
+        self.gate = (torch.rand(self.num_envs, 1, generator=self.generator) < self.gate_probability).float()
+        self.gate = self.gate.to(self.device)
+
+    def labels(self, points_z, proprio):
+        """Hindsight-style targets (K, Q, 3) and their validity (K, Q) of the rule above."""
+        flat = points_z.reshape(points_z.shape[0], -1)
+        order = flat.argsort(dim=-1, descending=True)[:, : self.NUM_BODIES]  # (K, Q)
+        xy = self.points_xy.reshape(-1, 2)[order]  # (K, Q, 2)
+        z = torch.gather(flat, 1, order).unsqueeze(-1)
+        valid = proprio[:, : self.NUM_BODIES] > 0
+        return torch.cat([xy, z], dim=-1) * valid.unsqueeze(-1), valid
+
+    def _obs_pack(self):
+        actor = torch.cat(
+            [self.proprio, torch.full((self.num_envs, self.NUM_BODIES * 3), self.REFERENCE_TARGET, device=self.device)],
+            dim=-1,
+        )
+        planner = torch.cat(
+            [
+                self.points_xy.unsqueeze(0).expand(self.num_envs, -1, -1, -1).reshape(self.num_envs, -1),
+                self.points_z.reshape(self.num_envs, -1),
+                self.proprio,
+            ],
+            dim=-1,
+        )
+        return {"policy": actor, "critic": actor.clone(), "planner": planner, "contact_source": self.gate.clone()}
+
+    def get_observations(self):
+        pack = self._obs_pack()
+        return pack["policy"], {"observations": pack}
+
+    def reset(self):
+        return self.get_observations()
+
+    def set_policy_feedback(self, feedback):
+        self.feedback_history.append({k: v.clone() for k, v in feedback.items()})
+
+    def set_training_iteration(self, iteration):
+        self.iteration_history.append(int(iteration))
+
+    def step(self, actions):
+        planner_obs = self._obs_pack()["planner"]
+        target_pos, target_valid = self.labels(self.points_z, self.proprio)
+        samples = {"planner_obs": planner_obs, "target_pos": target_pos, "target_valid": target_valid}
+        reward = -(actions.to(self.device) ** 2).sum(-1, keepdim=True) * 0.01
+        self.episode_length_buf += 1
+        time_out = self.episode_length_buf >= self.max_episode_length
+        self.episode_length_buf[time_out] = 0
+        self._sample_obs()
+        pack = self._obs_pack()
+        infos = {"observations": pack, "time_outs": time_out, "planner_samples": samples}
+        return pack["policy"], reward, time_out.float(), infos

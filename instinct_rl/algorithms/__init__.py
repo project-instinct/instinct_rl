@@ -30,6 +30,7 @@
 
 from .estimator import EstimatorPPO, EstimatorTPPO
 from .lipschitz import LipschitzPPO
+from .planner import ContactPlannerPPO, PlannerAlgoMixin
 from .ppo import PPO
 from .supermimic import SuperMimic
 from .tppo import TPPO
@@ -47,6 +48,7 @@ class WasabiEstimatorPPO(WasabiAlgoMixin, EstimatorPPO):
 
 __all__ = [
     "PPO",
+    "ContactPlannerPPO",
     "SuperMimic",
     "TPPO",
     "EstimatorPPO",

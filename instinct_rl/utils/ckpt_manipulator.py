@@ -206,3 +206,24 @@ def newStd(
         else:
             new_state_dict[state_dict_key] = source_state_dict[state_dict_key]
     return new_state_dict
+
+
+def add_missing_algorithm_state(source_state_dict: dict, algo_state_dict: dict):
+    """Start a new training stage from a checkpoint of an algorithm that keeps less state.
+
+    For example, a ``PPO`` tracker checkpoint loaded into ``ContactPlannerPPO``: every entry of the checkpoint is
+    kept (model, optimizer, normalizers), the top-level entries only the new algorithm has (e.g. the planner and its
+    optimizer) are taken from the freshly built algorithm, and the iteration counter restarts at 0, so the new
+    stage's schedules count from its own start. A checkpoint that already has every entry is returned unchanged, so
+    resuming the new stage with the same option keeps its iteration.
+    """
+    missing = [k for k in algo_state_dict if k not in source_state_dict]
+    if not missing:
+        print("\033[1;36m The checkpoint has every algorithm entry; loading it unchanged \033[0m")
+        return source_state_dict
+    print(f"\033[1;36m New algorithm entries, freshly initialized: {missing}; the iteration restarts at 0 \033[0m")
+    new_state_dict = dict(source_state_dict)
+    for key in missing:
+        new_state_dict[key] = algo_state_dict[key]
+    new_state_dict["iter"] = 0
+    return new_state_dict
