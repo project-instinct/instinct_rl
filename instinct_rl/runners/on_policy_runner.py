@@ -196,6 +196,9 @@ class OnPolicyRunner:
         tot_start_time = time.time()
         start = time.time()
         while self.current_learning_iteration < tot_iter:
+            # an env with iteration-dependent schedules (curricula, hand-offs) reads the iteration from here
+            if hasattr(self.env, "set_training_iteration"):
+                self.env.set_training_iteration(self.current_learning_iteration)
             # Rollout
             with torch.inference_mode(self.cfg.get("inference_mode_rollout", True)):
                 for i in range(self.num_steps_per_env):
@@ -249,6 +252,9 @@ class OnPolicyRunner:
 
     def rollout_step(self, obs, extra_obs):
         actions = self.alg.act(obs, extra_obs)
+        # an algorithm whose outputs the env's rewards follow (e.g. a planner's targets) sends them before the step
+        if hasattr(self.alg, "get_policy_feedback"):
+            self.env.set_policy_feedback(self.alg.get_policy_feedback())
         obs, rewards, dones, infos = self.env.step(actions)
         extra_obs = infos["observations"]
         extra_obs.setdefault("policy", obs)
@@ -560,7 +566,12 @@ class OnPolicyRunner:
             obs = self.normalizers["policy"](obs)
             # also export obs normalizer
             self.normalizers["policy"].export(os.path.join(export_model_dir, "policy_normalizer.npz"))
-        self.alg.actor_critic.export_as_onnx(obs, export_model_dir)
+        if hasattr(self.alg, "export_as_onnx"):
+            # an algorithm with networks besides the actor (e.g. a planner) exports them all
+            _, extras = self.env.get_observations()
+            self.alg.export_as_onnx(obs, extras["observations"], export_model_dir)
+        else:
+            self.alg.actor_critic.export_as_onnx(obs, export_model_dir)
 
     """
     Helper functions
