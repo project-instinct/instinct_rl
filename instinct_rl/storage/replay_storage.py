@@ -10,6 +10,8 @@ The storage is generic: the caller declares which tensors to keep with ``TensorS
 same class serves a dynamics-model fit (state/action/context) and anything else that needs raw
 transitions.
 
+:class:`FifoReplayBuffer` (at the end) keeps independent samples instead of steps, e.g. supervised targets.
+
 Design notes:
 
 * Allocation is ``(capacity_per_env, num_envs, *feature)``; the newest step overwrites the oldest. A
@@ -375,3 +377,86 @@ class ReplayStorage:
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.extra_repr()})"
+
+
+class FifoReplayBuffer:
+    """Flat first-in-first-out buffer of independent samples, sampled uniformly.
+
+    For supervision targets that arrive in variable-size batches (e.g. hindsight labels of finished episodes),
+    unlike :class:`ReplayStorage`, which keeps whole ``(time, env)`` steps.
+
+    Args:
+        capacity: Maximum number of samples; the oldest are overwritten first.
+        specs: ``{name: TensorSpec}`` of every stored tensor (per sample).
+        device: Device of the storage.
+    """
+
+    def __init__(self, capacity: int, specs: dict[str, TensorSpec], device: str | torch.device = "cpu"):
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        self.capacity = int(capacity)
+        self.specs = dict(specs)
+        self.device = torch.device(device)
+        self._buffers = {
+            name: torch.zeros(self.capacity, *spec.shape, dtype=spec.dtype, device=self.device)
+            for name, spec in self.specs.items()
+        }
+        self._cursor = 0  # next slot to write
+        self._filled = 0
+
+    def add(self, samples: dict[str, torch.Tensor]) -> int:
+        """Append ``{name: (K, *spec.shape)}`` for every stored tensor; returns K. Of more than ``capacity``
+        samples only the last ``capacity`` are kept."""
+        if set(samples) != set(self.specs):
+            raise KeyError(f"samples have keys {sorted(samples)}, expected {sorted(self.specs)}")
+        num = None
+        for name, spec in self.specs.items():
+            value = samples[name]
+            if tuple(value.shape[1:]) != tuple(spec.shape) or (num is not None and value.shape[0] != num):
+                raise ValueError(f"{name!r}: got shape {tuple(value.shape)}, expected (K, *{tuple(spec.shape)})")
+            num = value.shape[0]
+        if num == 0:
+            return 0
+        keep = min(num, self.capacity)
+        index = (self._cursor + torch.arange(keep, device=self.device)) % self.capacity
+        for name, buffer in self._buffers.items():
+            buffer[index] = samples[name][num - keep :].to(dtype=buffer.dtype, device=self.device)
+        self._cursor = (self._cursor + keep) % self.capacity
+        self._filled = min(self._filled + keep, self.capacity)
+        return num
+
+    def sample(self, batch_size: int, generator: torch.Generator | None = None) -> dict[str, torch.Tensor]:
+        """``batch_size`` samples drawn uniformly with replacement."""
+        if self._filled == 0:
+            raise RuntimeError("cannot sample an empty replay buffer")
+        index = torch.randint(self._filled, (batch_size,), generator=generator, device="cpu").to(self.device)
+        return {name: buffer[index] for name, buffer in self._buffers.items()}
+
+    def __len__(self) -> int:
+        return self._filled
+
+    def state_dict(self) -> dict[str, torch.Tensor | int]:
+        state: dict[str, torch.Tensor | int] = {
+            "cursor": int(self._cursor),
+            "filled": int(self._filled),
+            "capacity": int(self.capacity),
+        }
+        for name, buffer in self._buffers.items():
+            state[f"buffer/{name}"] = buffer
+        return state
+
+    def load_state_dict(self, state: dict) -> None:
+        if int(state["capacity"]) != self.capacity:
+            raise ValueError(f"replay capacity mismatch: checkpoint {state['capacity']}, current {self.capacity}")
+        for name, buffer in self._buffers.items():
+            saved = state[f"buffer/{name}"]
+            if saved.shape != buffer.shape:
+                raise ValueError(
+                    f"replay buffer {name!r} shape mismatch: {tuple(saved.shape)} vs {tuple(buffer.shape)}"
+                )
+            buffer.copy_(saved.to(dtype=buffer.dtype, device=buffer.device))
+        self._cursor = int(state["cursor"])
+        self._filled = int(state["filled"])
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(capacity={self.capacity}, filled={self._filled}, keys={sorted(self.specs)})"
