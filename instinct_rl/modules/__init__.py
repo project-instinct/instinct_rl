@@ -3,12 +3,14 @@ from typing import Dict
 
 from .actor_critic import ActorCritic
 from .actor_critic_recurrent import ActorCriticRecurrent
+from .attention import CrossAttention, FiLM
 from .all_mixer import (
     EncoderMoEActorCritic,
     EncoderStateAc,
     EncoderStateAcRecurrent,
     EncoderVaeActorCritic,
 )
+from .contact_planner import AttentionContactPlanner, ContactPlanner, MlpContactPlanner
 from .discriminator import Discriminator
 from .encoder_actor_critic import EncoderActorCritic, EncoderActorCriticRecurrent
 from .moe_actor_critic import MoEActorCritic
