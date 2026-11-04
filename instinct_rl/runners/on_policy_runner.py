@@ -99,7 +99,11 @@ class OnPolicyRunner:
         ).to(self.device)
 
         alg_class_name = self.alg_cfg.pop("class_name")
-        alg_class = importlib.import_module() if ":" in alg_class_name else getattr(algorithms, alg_class_name)
+        if ":" in alg_class_name:
+            module_name, class_name = alg_class_name.split(":")
+            alg_class = getattr(importlib.import_module(module_name), class_name)
+        else:
+            alg_class = getattr(algorithms, alg_class_name)
         self.alg: algorithms.PPO = alg_class(
             actor_critic,
             device=self.device,

@@ -623,3 +623,26 @@ def test_reference_residual_adds_the_raw_reference():
     assert "reference_residual_scale" in model.state_dict()
     with pytest.raises(NotImplementedError):
         model.act(obs)
+
+
+def test_runner_resolves_an_algorithm_by_module_path():
+    from instinct_rl.algorithms.ppo import PPO
+    from instinct_rl.runners import OnPolicyRunner
+
+    class _Env(FakeVecEnv):
+        num_actions = NUM_ACTIONS
+
+        def get_obs_format(self):
+            return OBS_FORMAT
+
+        def reset(self):
+            return self.get_observations()
+
+    cfg = {
+        "algorithm": {"class_name": "instinct_rl.algorithms.ppo:PPO"},
+        "policy": {"class_name": "ActorCritic", "actor_hidden_dims": [8], "critic_hidden_dims": [8]},
+        "num_steps_per_env": 2,
+        "save_interval": 10,
+    }
+    runner = OnPolicyRunner(_Env(num_envs=4), cfg, log_dir=None, device="cpu")
+    assert type(runner.alg) is PPO
