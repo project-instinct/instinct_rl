@@ -7,6 +7,38 @@ import torch.nn as nn
 from instinct_rl.modules.mlp import MlpModel
 
 
+class SingleQueryAttention(nn.Module):
+    """Multi-head attention of one query over ``N`` tokens, as ``nn.MultiheadAttention`` computes it, but without
+    projecting every token: the key projection is folded into the query (``q_h . (W_h t + b_h) = (W_h^T q_h) . t +
+    q_h . b_h``) and the value projection is applied after the attention-weighted token sum, so the cost per token
+    is one ``num_heads x dim`` product instead of two ``dim x dim`` projections."""
+
+    def __init__(self, dim: int, num_heads: int):
+        super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim {dim} is not divisible by num_heads {num_heads}")
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+
+    def forward(self, query: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
+        """``query`` ``(B, dim)``, ``tokens`` ``(B, N, dim)`` -> ``(B, dim)``."""
+        batch, dim = query.shape
+        heads, head_dim = self.num_heads, self.head_dim
+        q = self.q_proj(query).view(batch, heads, head_dim) / head_dim**0.5
+        k_weight = self.k_proj.weight.view(heads, head_dim, dim)
+        q_tokens = torch.einsum("bhd,hdc->bhc", q, k_weight)  # (B, heads, dim)
+        q_bias = torch.einsum("bhd,hd->bh", q, self.k_proj.bias.view(heads, head_dim))
+        scores = torch.einsum("bhc,bnc->bhn", q_tokens, tokens) + q_bias.unsqueeze(-1)
+        weighted = torch.einsum("bhn,bnc->bhc", scores.softmax(dim=-1), tokens)  # (B, heads, dim)
+        v_weight = self.v_proj.weight.view(heads, head_dim, dim)
+        values = torch.einsum("bhc,hdc->bhd", weighted, v_weight) + self.v_proj.bias.view(heads, head_dim)
+        return self.out_proj(values.reshape(batch, dim))
+
+
 class AME2ImageEncoder(nn.Module):
     """AME-2 attention-based map encoder (Zhang et al., "Agile and Generalized Legged Locomotion via Attention-Based
     Neural Map Encoding", Sec. IV-A) on an image instead of a height map.
@@ -73,7 +105,7 @@ class AME2ImageEncoder(nn.Module):
         self.query_mlp = MlpModel(
             prop_dim + global_dim, [hidden_size, hidden_size], output_size=local_dim, nonlinearity=activation
         )
-        self.attention = nn.MultiheadAttention(embed_dim=local_dim, num_heads=num_heads, batch_first=True)
+        self.attention = SingleQueryAttention(local_dim, num_heads)
         self._output_size = local_dim + prop_dim + global_dim
 
     @property
@@ -94,7 +126,7 @@ class AME2ImageEncoder(nn.Module):
 
         global_features = self.global_mlp(local).max(dim=1)[0]
         prop_embedding = self.prop_encoder(prop)
-        query = self.query_mlp(torch.cat([prop_embedding, global_features], dim=-1)).unsqueeze(1)
-        attended = self.attention(query, local, local, need_weights=False)[0].squeeze(1)
+        query = self.query_mlp(torch.cat([prop_embedding, global_features], dim=-1))
+        attended = self.attention(query, local)
         output = torch.cat([attended, prop_embedding, global_features], dim=-1)
         return output.reshape(*leading_shape, self._output_size)
