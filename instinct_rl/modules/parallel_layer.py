@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from instinct_rl.modules.ame2 import AME2ImageEncoder
 from instinct_rl.modules.conv2d import Conv2dHeadModel
 from instinct_rl.modules.mlp import MlpModel
 from instinct_rl.modules.transformer import TransformerHeadModel
@@ -89,6 +90,10 @@ class ParallelLayer(nn.Module):
                 output_size=output_size,
                 **model_kwargs,
             )
+        elif model_class_name == "AME2ImageEncoder":
+            model = AME2ImageEncoder(input_segments, config["component_names"], **model_kwargs)
+            if model.output_size != output_size:
+                raise ValueError(f"AME2ImageEncoder outputs {model.output_size} features, config says {output_size}")
         else:
             model = None  # leave for subclass to implement
         return model
