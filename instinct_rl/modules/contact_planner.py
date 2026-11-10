@@ -13,7 +13,9 @@ Planner observation layout (one flat vector per sample, segments as in ``obs_for
 
 - ``points_xy_component``: shape ``(rows, cols, 2)``, the x, y of every terrain point (body-yaw frame);
 - ``points_z_component``: shape ``(rows, cols)``, their heights relative to the base (the CNN's image);
-- ``context_components``: everything the context encoder reads (proprioception history, goal).
+- ``context_components``: everything the context encoder reads (proprioception history, goal);
+- optional ``image_component``: shape ``(channels, height, width)``, an image (e.g. the depth camera) embedded by an
+  AME-2 attention encoder whose query is the normalized context; the embedding is appended to the context.
 """
 
 from __future__ import annotations
@@ -28,11 +30,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .attention import FiLM, CrossAttention
+from instinct_rl.utils.utils import get_obs_slice, get_subobs_by_components
+
+from .ame2 import AME2ImageEncoder
+from .attention import CrossAttention, FiLM
 from .conv2d import Conv2dModel
 from .mlp import MlpModel
 from .normalizer import EmpiricalNormalization
-from instinct_rl.utils.utils import get_obs_slice, get_subobs_by_components
 
 
 class ContactPlanner(nn.Module):
@@ -52,6 +56,8 @@ class ContactPlanner(nn.Module):
         occupancy_loss_coef: Weight of the occupancy binary cross-entropy.
         normalize_context: Normalize the context vector with running statistics, updated from training batches
             only (:meth:`compute_loss`); exported with the planner.
+        image_component: Optional image component ``(channels, height, width)``, not part of the context.
+        image_encoder_kwargs: Arguments of its :class:`AME2ImageEncoder` (sizes, heads).
     """
 
     def __init__(
@@ -68,6 +74,8 @@ class ContactPlanner(nn.Module):
         affordance_loss_coef: float,
         occupancy_loss_coef: float,
         normalize_context: bool,
+        image_component: str | None = None,
+        image_encoder_kwargs: dict | None = None,
     ):
         super().__init__()
         self.input_segments = OrderedDict(input_segments)
@@ -99,6 +107,26 @@ class ContactPlanner(nn.Module):
         self.context_normalizer = EmpiricalNormalization(self.context_size) if normalize_context else None
         self._xy_slice = get_obs_slice(self.input_segments, points_xy_component)[0]
         self._z_slice = get_obs_slice(self.input_segments, points_z_component)[0]
+        # size of what the planner networks read as context: the normalized context and the image embedding
+        self.context_input_size = self.context_size
+        self.image_component = image_component
+        self.image_encoder = None
+        if image_component is not None:
+            if image_component in self.context_components:
+                raise ValueError(f"image component {image_component!r} must not also be a context component")
+            image_shape = tuple(self.input_segments[image_component])
+            if len(image_shape) != 3:
+                raise ValueError(
+                    f"image {image_component!r} must be shaped (channels, height, width), got {image_shape}"
+                )
+            self._image_slice = get_obs_slice(self.input_segments, image_component)[0]
+            self.image_encoder = AME2ImageEncoder(
+                OrderedDict(context=(self.context_size,), image=image_shape),
+                ["context", "image"],
+                "image",
+                **(image_encoder_kwargs or {}),
+            )
+            self.context_input_size += self.image_encoder.output_size
 
     @property
     def output_size(self) -> int:
@@ -122,6 +150,9 @@ class ContactPlanner(nn.Module):
         points, context = self.split_obs(planner_obs)
         if self.context_normalizer is not None:
             context = self.context_normalizer.normalize(context)
+        if self.image_encoder is not None:
+            image = planner_obs[:, self._image_slice]
+            context = torch.cat([context, self.image_encoder(torch.cat([context, image], dim=-1))], dim=-1)
         log_affordance, occupancy_logits = self.scores(points, context)
         return points, log_affordance, occupancy_logits
 
@@ -268,6 +299,8 @@ class AttentionContactPlanner(ContactPlanner):
         affordance_loss_coef: float = 1.0,
         occupancy_loss_coef: float = 1.0,
         normalize_context: bool = True,
+        image_component: str | None = None,
+        image_encoder_kwargs: dict | None = None,
     ):
         super().__init__(
             input_segments,
@@ -282,6 +315,8 @@ class AttentionContactPlanner(ContactPlanner):
             affordance_loss_coef,
             occupancy_loss_coef,
             normalize_context,
+            image_component,
+            image_encoder_kwargs,
         )
         self.attention_residual = bool(attention_residual)
         if cnn_kernel_size % 2 != 1:
@@ -298,7 +333,7 @@ class AttentionContactPlanner(ContactPlanner):
         self.feature_proj = nn.Linear(point_embedding_size + cnn_channels[-1], d_model)
         self.terrain_context = MlpModel(d_model, list(terrain_context_sizes), nonlinearity=nonlinearity)
         self.encoder = MlpModel(
-            self.context_size + terrain_context_sizes[-1],
+            self.context_input_size + terrain_context_sizes[-1],
             list(encoder_hidden_sizes),
             output_size=d_model,
             nonlinearity=nonlinearity,
@@ -353,6 +388,8 @@ class MlpContactPlanner(ContactPlanner):
         affordance_loss_coef: float = 1.0,
         occupancy_loss_coef: float = 1.0,
         normalize_context: bool = True,
+        image_component: str | None = None,
+        image_encoder_kwargs: dict | None = None,
     ):
         super().__init__(
             input_segments,
@@ -367,8 +404,12 @@ class MlpContactPlanner(ContactPlanner):
             affordance_loss_coef,
             occupancy_loss_coef,
             normalize_context,
+            image_component,
+            image_encoder_kwargs,
         )
-        self.backbone = MlpModel(self.context_size + 3 * self.num_points, list(hidden_sizes), nonlinearity=nonlinearity)
+        self.backbone = MlpModel(
+            self.context_input_size + 3 * self.num_points, list(hidden_sizes), nonlinearity=nonlinearity
+        )
         self.affordance_head = nn.Linear(hidden_sizes[-1], self.num_bodies * self.num_points)
         self.occupancy_head = nn.Linear(hidden_sizes[-1], self.num_bodies)
 

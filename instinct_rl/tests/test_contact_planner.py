@@ -180,6 +180,36 @@ def test_planner_onnx_matches_pytorch(cls, tmp_path):
         np.testing.assert_allclose(occupancy, torch.sigmoid(logits).numpy(), atol=1e-5)
 
 
+@pytest.mark.parametrize("cls", [AttentionContactPlanner, MlpContactPlanner])
+def test_planner_with_an_image_input(cls):
+    segments = OrderedDict({"xy": (3, 4, 2), "z": (3, 4), "proprio": (6,), "image": (1, 5, 6)})
+    size = SMALL_ATTENTION if cls is AttentionContactPlanner else SMALL_MLP
+    image_kwargs = dict(num_heads=4, local_dim=8, global_dim=8, prop_dim=8, hidden_size=16)
+    planner = cls(
+        segments,
+        "xy",
+        "z",
+        ["proprio"],
+        num_bodies=2,
+        image_component="image",
+        image_encoder_kwargs=image_kwargs,
+        **size,
+    )
+    assert planner.context_size == 6 and planner.context_input_size == 6 + 8 + 8 + 8
+    obs = torch.randn(5, 12 * 3 + 6 + 30)
+    points, log_affordance, occupancy_logits = planner(obs)
+    assert points.shape == (5, 12, 3) and log_affordance.shape == (5, 2, 12) and occupancy_logits.shape == (5, 2)
+    # the image reaches the outputs
+    changed = obs.clone()
+    changed[:, -30:] += 1.0
+    assert not torch.allclose(planner(changed)[1], log_affordance)
+    losses, _ = planner.compute_loss(obs, torch.randn(5, 2, 3), torch.ones(5, 2, dtype=torch.bool))
+    losses["loss"].backward()
+    assert planner.image_encoder.cnn[0].weight.grad.abs().sum() > 0
+    with pytest.raises(ValueError):
+        cls(segments, "xy", "z", ["proprio", "image"], num_bodies=2, image_component="image", **size)
+
+
 def test_planner_rejects_bad_layouts():
     segments = OrderedDict({"xy": (3, 4, 2), "z": (4, 3), "proprio": (4,)})
     with pytest.raises(ValueError):
