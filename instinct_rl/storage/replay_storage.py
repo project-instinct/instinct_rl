@@ -460,3 +460,137 @@ class FifoReplayBuffer:
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(capacity={self.capacity}, filled={self._filled}, keys={sorted(self.specs)})"
+
+
+class PartitionedReplayBuffer:
+    """Samples kept in one first-in-first-out ring per partition and drawn balanced over partition groups.
+
+    For hindsight labels from many terrains (e.g. one partition per reference clip, grouped by terrain category): a
+    common terrain cannot push the labels of a rare one out of the buffer, and every group is sampled equally often.
+    ``sample`` draws a group uniformly among the groups with stored samples, then a partition of that group uniformly
+    among its nonempty partitions, then a stored sample of that partition uniformly.
+
+    Args:
+        num_partitions: Number of partitions (ids ``0 .. num_partitions - 1``).
+        capacity_per_partition: Samples kept per partition; the oldest are overwritten first.
+        specs: ``{name: TensorSpec}`` of every stored tensor (per sample), without the partition keys.
+        device: Device of the storage.
+
+    ``add`` takes the stored tensors plus ``partition`` and ``group`` (``(K,)`` integer): a partition belongs to the
+    group of its latest samples.
+    """
+
+    def __init__(
+        self,
+        num_partitions: int,
+        capacity_per_partition: int,
+        specs: dict[str, TensorSpec],
+        device: str | torch.device = "cpu",
+    ):
+        if num_partitions <= 0 or capacity_per_partition <= 0:
+            raise ValueError("num_partitions and capacity_per_partition must be positive")
+        self.num_partitions = int(num_partitions)
+        self.capacity_per_partition = int(capacity_per_partition)
+        self.specs = dict(specs)
+        self.device = torch.device(device)
+        shape = (self.num_partitions, self.capacity_per_partition)
+        self._buffers = {
+            name: torch.zeros(*shape, *spec.shape, dtype=spec.dtype, device=self.device)
+            for name, spec in self.specs.items()
+        }
+        self._cursor = torch.zeros(self.num_partitions, dtype=torch.long, device=self.device)
+        self._filled = torch.zeros(self.num_partitions, dtype=torch.long, device=self.device)
+        self._group = torch.full((self.num_partitions,), -1, dtype=torch.long, device=self.device)
+
+    def add(self, samples: dict[str, torch.Tensor]) -> int:
+        """Append ``{name: (K, *spec.shape)}`` plus ``partition`` / ``group`` ``(K,)``; returns K. Of more than
+        ``capacity_per_partition`` samples of one partition only the last ones are kept."""
+        expected = set(self.specs) | {"partition", "group"}
+        if set(samples) != expected:
+            raise KeyError(f"samples have keys {sorted(samples)}, expected {sorted(expected)}")
+        partition = samples["partition"].to(device=self.device, dtype=torch.long)
+        group = samples["group"].to(device=self.device, dtype=torch.long)
+        num = partition.shape[0]
+        for name, spec in self.specs.items():
+            value = samples[name]
+            if tuple(value.shape) != (num, *spec.shape):
+                raise ValueError(f"{name!r}: got shape {tuple(value.shape)}, expected ({num}, *{tuple(spec.shape)})")
+        if num == 0:
+            return 0
+        if bool(((partition < 0) | (partition >= self.num_partitions)).any()):
+            raise ValueError(f"partition ids must be in [0, {self.num_partitions})")
+        # rank of each sample within its partition, in arrival order (stable sort keeps the order)
+        order = torch.sort(partition, stable=True).indices
+        sorted_partition = partition[order]
+        counts = torch.bincount(partition, minlength=self.num_partitions)
+        first = torch.cumsum(counts, 0) - counts
+        rank = torch.empty_like(partition)
+        rank[order] = torch.arange(num, device=self.device) - first[sorted_partition]
+        # keep the last ``capacity`` samples of each partition
+        keep = rank >= counts[partition] - self.capacity_per_partition
+        kept_rank = rank - (counts[partition] - self.capacity_per_partition).clamp_min(0)
+        slot = (self._cursor[partition] + kept_rank) % self.capacity_per_partition
+        rows, cols = partition[keep], slot[keep]
+        for name, buffer in self._buffers.items():
+            buffer[rows, cols] = samples[name].to(device=self.device, dtype=buffer.dtype)[keep]
+        written = counts.clamp(max=self.capacity_per_partition)
+        self._cursor = (self._cursor + written) % self.capacity_per_partition
+        self._filled = (self._filled + written).clamp(max=self.capacity_per_partition)
+        self._group[partition] = group  # the last sample of a partition decides its group
+        return num
+
+    def sample(self, batch_size: int, generator: torch.Generator | None = None) -> dict[str, torch.Tensor]:
+        """``batch_size`` samples, balanced over groups, then partitions, then stored samples (with replacement)."""
+        nonempty = (self._filled > 0).nonzero().squeeze(-1)
+        if nonempty.numel() == 0:
+            raise RuntimeError("cannot sample an empty replay buffer")
+        groups, group_index = torch.unique(self._group[nonempty], return_inverse=True)
+        # (groups, partitions) table of each group's nonempty partitions, padded
+        per_group = torch.bincount(group_index, minlength=groups.numel())
+        order = torch.sort(group_index, stable=True).indices
+        start = torch.cumsum(per_group, 0) - per_group
+        table = torch.zeros(groups.numel(), int(per_group.max()), dtype=torch.long, device=self.device)
+        position = torch.arange(nonempty.numel(), device=self.device) - start[group_index[order]]
+        table[group_index[order], position] = nonempty[order]
+        uniform = torch.rand(batch_size, 3, generator=generator, device="cpu").to(self.device)
+        chosen_group = (uniform[:, 0] * groups.numel()).long().clamp(max=groups.numel() - 1)
+        chosen_slot = (uniform[:, 1] * per_group[chosen_group]).long().clamp(max=per_group[chosen_group] - 1)
+        chosen_partition = table[chosen_group, chosen_slot]
+        filled = self._filled[chosen_partition]
+        chosen_sample = (uniform[:, 2] * filled).long().clamp(max=filled - 1)
+        return {name: buffer[chosen_partition, chosen_sample] for name, buffer in self._buffers.items()}
+
+    def __len__(self) -> int:
+        return int(self._filled.sum())
+
+    def state_dict(self) -> dict[str, torch.Tensor | int]:
+        state: dict[str, torch.Tensor | int] = {
+            "num_partitions": self.num_partitions,
+            "capacity_per_partition": self.capacity_per_partition,
+            "cursor": self._cursor,
+            "filled": self._filled,
+            "group": self._group,
+        }
+        for name, buffer in self._buffers.items():
+            state[f"buffer/{name}"] = buffer
+        return state
+
+    def load_state_dict(self, state: dict) -> None:
+        for key, value in (("num_partitions", self.num_partitions), ("capacity_per_partition", self.capacity_per_partition)):
+            if int(state[key]) != value:
+                raise ValueError(f"replay {key} mismatch: checkpoint {state[key]}, current {value}")
+        for name, buffer in self._buffers.items():
+            saved = state[f"buffer/{name}"]
+            if saved.shape != buffer.shape:
+                raise ValueError(
+                    f"replay buffer {name!r} shape mismatch: {tuple(saved.shape)} vs {tuple(buffer.shape)}"
+                )
+            buffer.copy_(saved.to(dtype=buffer.dtype, device=buffer.device))
+        for key in ("cursor", "filled", "group"):
+            getattr(self, f"_{key}").copy_(state[key].to(self.device))
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(num_partitions={self.num_partitions},"
+            f" capacity_per_partition={self.capacity_per_partition}, filled={len(self)}, keys={sorted(self.specs)})"
+        )

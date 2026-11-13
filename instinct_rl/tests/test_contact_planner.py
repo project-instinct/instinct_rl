@@ -20,7 +20,7 @@ from instinct_rl.modules import (
     MlpContactPlanner,
 )
 from instinct_rl.runners import OnPolicyRunner
-from instinct_rl.storage.replay_storage import FifoReplayBuffer, TensorSpec
+from instinct_rl.storage.replay_storage import FifoReplayBuffer, PartitionedReplayBuffer, TensorSpec
 from instinct_rl.tests.fake_env import FakeContactPlannerEnv
 from instinct_rl.utils import ckpt_manipulator
 from instinct_rl.utils.utils import get_obs_slice
@@ -252,6 +252,46 @@ def test_fifo_replay_overwrites_oldest_and_round_trips(tmp_path):
         FifoReplayBuffer(6, _specs()).load_state_dict(replay.state_dict())
     with pytest.raises(KeyError):
         replay.add({"x": torch.zeros(1, 2)})
+
+
+def _partitioned_samples(values, partition, group):
+    values = torch.as_tensor(values, dtype=torch.float)
+    return {
+        "x": values[:, None].expand(-1, 2),
+        "flag": torch.zeros(len(values), 3, dtype=torch.bool),
+        "partition": torch.as_tensor(partition),
+        "group": torch.as_tensor(group),
+    }
+
+
+def test_partitioned_replay_keeps_the_newest_per_partition_and_round_trips(tmp_path):
+    replay = PartitionedReplayBuffer(3, 4, _specs())
+    # partition 0 gets 6 samples in two adds (only the newest 4 stay), partition 2 gets 2
+    replay.add(_partitioned_samples([0, 1, 100, 2], [0, 0, 2, 0], [0, 0, 1, 0]))
+    replay.add(_partitioned_samples([3, 101, 4, 5], [0, 2, 0, 0], [0, 1, 0, 0]))
+    assert len(replay) == 6 and replay._filled.tolist() == [4, 0, 2]
+    assert sorted(replay._buffers["x"][0, :, 0].tolist()) == [2.0, 3.0, 4.0, 5.0]
+    assert sorted(replay._buffers["x"][2, :2, 0].tolist()) == [100.0, 101.0]
+    # one add with more samples than a partition holds keeps its last ones
+    replay.add(_partitioned_samples(list(range(10, 17)), [0] * 7, [0] * 7))
+    assert sorted(replay._buffers["x"][0, :, 0].tolist()) == [13.0, 14.0, 15.0, 16.0]
+    torch.save(replay.state_dict(), tmp_path / "replay.pt")
+    restored = PartitionedReplayBuffer(3, 4, _specs())
+    restored.load_state_dict(torch.load(tmp_path / "replay.pt", weights_only=True))
+    assert torch.equal(restored._buffers["x"], replay._buffers["x"]) and torch.equal(restored._group, replay._group)
+    with pytest.raises(ValueError):
+        PartitionedReplayBuffer(3, 5, _specs()).load_state_dict(replay.state_dict())
+    with pytest.raises(KeyError):
+        replay.add({"x": torch.zeros(1, 2), "flag": torch.zeros(1, 3, dtype=torch.bool)})
+
+
+def test_partitioned_replay_samples_groups_then_partitions_evenly():
+    replay = PartitionedReplayBuffer(4, 1000, _specs())
+    # group 0: partition 0 with 1000 samples (value 0) and partition 1 with 10 (value 1); group 1: partition 3 with 5
+    replay.add(_partitioned_samples([0.0] * 1000 + [1.0] * 10 + [3.0] * 5, [0] * 1000 + [1] * 10 + [3] * 5, [0] * 1010 + [1] * 5))
+    batch = replay.sample(40000, generator=torch.Generator().manual_seed(0))
+    share = torch.stack([(batch["x"][:, 0] == v).float().mean() for v in (0.0, 1.0, 3.0)])
+    assert torch.allclose(share, torch.tensor([0.25, 0.25, 0.5]), atol=0.02)
 
 
 # -- algorithm -----------------------------------------------------------------------------------

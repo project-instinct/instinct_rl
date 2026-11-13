@@ -34,11 +34,13 @@ import instinct_rl.modules as instinct_modules
 from instinct_rl.algorithms.ppo import PPO
 from instinct_rl.modules.contact_planner import ContactPlanner
 from instinct_rl.modules.normalizer import EmpiricalNormalization
-from instinct_rl.storage.replay_storage import FifoReplayBuffer, TensorSpec
+from instinct_rl.storage.replay_storage import FifoReplayBuffer, PartitionedReplayBuffer, TensorSpec
 from instinct_rl.utils.utils import get_subobs_indexing_by_components, get_subobs_size
 
 #: Keys of the samples the environment sends (cross-repo contract, see the ACP reproduction plan, Sec. 8).
 PLANNER_SAMPLE_KEYS = ("planner_obs", "target_pos", "target_valid")
+#: With a partitioned replay the samples also carry their partition and group ids.
+PARTITIONED_SAMPLE_KEYS = PLANNER_SAMPLE_KEYS + ("partition", "group")
 
 
 class PlannerAlgoMixin:
@@ -64,6 +66,10 @@ class PlannerAlgoMixin:
         planner_accumulation_steps: Sub-batches the batch is split into, gradients accumulated over them.
         planner_min_samples: Replay size from which the planner trains (on every rank).
         planner_replay_capacity: Replay buffer size (samples).
+        planner_replay_num_partitions: None: one FIFO replay. Else a :class:`PartitionedReplayBuffer` with this many
+            partitions of ``planner_replay_partition_capacity`` samples, sampled balanced over the partition groups;
+            the env's samples then carry ``partition`` and ``group`` ids.
+        planner_replay_partition_capacity: Samples per partition of the partitioned replay.
         planner_replay_device: Device of the replay buffer; None = the algorithm's device.
         planner_replay_checkpoint: ``"latest"``: the replay is written to ``planner_replay_latest.pt`` beside the
             checkpoints, overwritten at every save, and restored when it belongs to the loaded checkpoint;
@@ -92,6 +98,8 @@ class PlannerAlgoMixin:
         planner_accumulation_steps: int = 8,
         planner_min_samples: int = 1000,
         planner_replay_capacity: int = 100_000,
+        planner_replay_num_partitions: int | None = None,
+        planner_replay_partition_capacity: int = 2000,
         planner_replay_device: str | None = None,
         planner_replay_checkpoint: str = "latest",
         **kwargs,
@@ -126,6 +134,8 @@ class PlannerAlgoMixin:
         self.planner_accumulation_steps = int(planner_accumulation_steps)
         self.planner_min_samples = int(planner_min_samples)
         self.planner_replay_capacity = int(planner_replay_capacity)
+        self.planner_replay_num_partitions = planner_replay_num_partitions
+        self.planner_replay_partition_capacity = int(planner_replay_partition_capacity)
         self.planner_replay_device = planner_replay_device if planner_replay_device is not None else self.device
         self.planner_replay_checkpoint = planner_replay_checkpoint
         self.policy_normalizer: EmpiricalNormalization | None = None
@@ -181,15 +191,20 @@ class PlannerAlgoMixin:
             self.planner.parameters(), **self.planner_optimizer_kwargs
         )
         num_bodies = self.planner.num_bodies
-        self.planner_replay = FifoReplayBuffer(
-            self.planner_replay_capacity,
-            {
-                "planner_obs": TensorSpec((int(get_subobs_size(obs_format[self.planner_obs_group])),)),
-                "target_pos": TensorSpec((num_bodies, 3)),
-                "target_valid": TensorSpec((num_bodies,), torch.bool),
-            },
-            device=self.planner_replay_device,
-        )
+        specs = {
+            "planner_obs": TensorSpec((int(get_subobs_size(obs_format[self.planner_obs_group])),)),
+            "target_pos": TensorSpec((num_bodies, 3)),
+            "target_valid": TensorSpec((num_bodies,), torch.bool),
+        }
+        if self.planner_replay_num_partitions is None:
+            self.planner_replay = FifoReplayBuffer(self.planner_replay_capacity, specs, device=self.planner_replay_device)
+        else:
+            self.planner_replay = PartitionedReplayBuffer(
+                self.planner_replay_num_partitions,
+                self.planner_replay_partition_capacity,
+                specs,
+                device=self.planner_replay_device,
+            )
 
     def act(self, obs, extra_obs):
         return super().act(self.compose_policy_obs(obs, extra_obs, target_noise=True), extra_obs)
@@ -227,7 +242,8 @@ class PlannerAlgoMixin:
 
     def process_env_step(self, rewards, dones, infos, next_obs, next_extra_obs):
         samples = infos.pop(self.planner_samples_key)
-        added = self.planner_replay.add({k: samples[k] for k in PLANNER_SAMPLE_KEYS})
+        keys = PLANNER_SAMPLE_KEYS if self.planner_replay_num_partitions is None else PARTITIONED_SAMPLE_KEYS
+        added = self.planner_replay.add({k: samples[k] for k in keys})
         self._planner_samples_this_iteration += added
         self._planner_samples_total += added
         super().process_env_step(rewards, dones, infos, next_obs, next_extra_obs)
