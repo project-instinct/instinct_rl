@@ -53,6 +53,7 @@ class ActorCritic(nn.Module):
         init_noise_std=1.0,
         num_rewards=1,
         mu_activation=None,  # If set, the last layer will be added with a special activation layer.
+        critic_obs_groups: list[str] | None = None,
         **kwargs,
     ):
         if kwargs:
@@ -72,18 +73,33 @@ class ActorCritic(nn.Module):
         self.mu_activation = mu_activation
         self.mlp_input_dim_a = get_subobs_size(self.__obs_segments)
         self.actor_hidden_dims = actor_hidden_dims
-        self.mlp_input_dim_c = get_subobs_size(self.__critic_obs_segments)
         self.critic_hidden_dims = critic_hidden_dims
+        self.critic_obs_groups = list(critic_obs_groups) if critic_obs_groups is not None else None
+        if self.critic_obs_groups is not None:
+            if len(self.critic_obs_groups) != num_rewards:
+                raise ValueError(
+                    f"critic_obs_groups has {len(self.critic_obs_groups)} entries, expected num_rewards={num_rewards}"
+                )
+            missing = [g for g in self.critic_obs_groups if g not in obs_format]
+            if missing:
+                raise KeyError(f"critic_obs_groups {missing} not in obs_format {list(obs_format)}")
+            self.critic_obs_sizes = [get_subobs_size(obs_format[g]) for g in self.critic_obs_groups]
+            self.mlp_input_dim_c = sum(self.critic_obs_sizes)
+        else:
+            self.critic_obs_sizes = None
+            self.mlp_input_dim_c = get_subobs_size(self.__critic_obs_segments)
 
         # Policy
         self.actor = self._build_actor(num_actions)
 
         # Value function
-        critic = self._build_critic(1)
-        if num_rewards > 1:
+        if self.critic_obs_groups is not None and num_rewards > 1:
+            self.critics = nn.ModuleList([self._build_critic(1, input_dim=sz) for sz in self.critic_obs_sizes])
+        elif num_rewards > 1:
+            critic = self._build_critic(1)
             self.critics = nn.ModuleList([critic] + [self._build_critic(1) for _ in range(num_rewards - 1)])
         else:
-            self.critic = critic
+            self.critic = self._build_critic(1)
 
         print(f"Actor MLP: {self.actor}")
         if num_rewards > 1:
@@ -124,11 +140,12 @@ class ActorCritic(nn.Module):
                 actor_layers.append(activation)
         return nn.Sequential(*actor_layers)
 
-    def _build_critic(self, num_values=1):
+    def _build_critic(self, num_values=1, input_dim=None):
         """Build the critic network, enabling multi-value prediction. Predict 1 value by default."""
+        in_dim = self.mlp_input_dim_c if input_dim is None else input_dim
         activation = get_activation(self.activation)
         critic_layers = []
-        critic_layers.append(nn.Linear(self.mlp_input_dim_c, self.critic_hidden_dims[0]))
+        critic_layers.append(nn.Linear(in_dim, self.critic_hidden_dims[0]))
         critic_layers.append(activation)
         for l in range(len(self.critic_hidden_dims)):
             if l == len(self.critic_hidden_dims) - 1:
@@ -175,6 +192,12 @@ class ActorCritic(nn.Module):
         if hasattr(self, "critics") and isinstance(critic_observations, list):
             value = torch.cat(
                 [critic(critic_obs) for critic, critic_obs in zip(self.critics, critic_observations)],
+                dim=-1,
+            )
+        elif hasattr(self, "critics") and self.critic_obs_sizes is not None:
+            parts = torch.split(critic_observations, self.critic_obs_sizes, dim=-1)
+            value = torch.cat(
+                [critic(part) for critic, part in zip(self.critics, parts)],
                 dim=-1,
             )
         elif hasattr(self, "critics"):

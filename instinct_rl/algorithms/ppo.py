@@ -62,6 +62,10 @@ class PPO:
         schedule="fixed",
         desired_kl=0.01,
         auxiliary_reward_per_env_reward_coefs: list[float] = list(),
+        value_mask_group: str | None = None,
+        critic_learning_rates: list[float | None] | None = None,
+        critic_warmup_iterations: list[int] | None = None,
+        critic_value_clipping: list[bool] | None = None,
         device="cpu",
         **kwargs,
     ):
@@ -87,7 +91,32 @@ class PPO:
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
         self.storage = None  # initialized later
-        self.optimizer = getattr(optim, optimizer_class_name)(self.actor_critic.parameters(), lr=learning_rate)
+        self.value_mask_group = value_mask_group
+        self.critic_obs_groups = getattr(self.actor_critic, "critic_obs_groups", None)
+        self.critic_learning_rates = list(critic_learning_rates) if critic_learning_rates is not None else None
+        self.critic_warmup_iterations = (
+            [int(w) for w in critic_warmup_iterations] if critic_warmup_iterations is not None else None
+        )
+        self.critic_value_clipping = (
+            [bool(c) for c in critic_value_clipping] if critic_value_clipping is not None else None
+        )
+        if self.critic_learning_rates is not None and any(lr is not None for lr in self.critic_learning_rates):
+            if not hasattr(self.actor_critic, "critics"):
+                raise ValueError(
+                    "critic_learning_rates requires a multi-critic ActorCritic (self.actor_critic.critics)"
+                )
+            fixed_param_ids: set[int] = set()
+            fixed_groups = []
+            for critic_mod, fixed_lr in zip(self.actor_critic.critics, self.critic_learning_rates):
+                if fixed_lr is not None:
+                    params = list(critic_mod.parameters())
+                    fixed_param_ids.update(id(p) for p in params)
+                    fixed_groups.append({"params": params, "lr": float(fixed_lr), "adaptive": False})
+            adaptive_params = [p for p in self.actor_critic.parameters() if id(p) not in fixed_param_ids]
+            param_groups = [{"params": adaptive_params, "lr": learning_rate, "adaptive": True}] + fixed_groups
+            self.optimizer = getattr(optim, optimizer_class_name)(param_groups)
+        else:
+            self.optimizer = getattr(optim, optimizer_class_name)(self.actor_critic.parameters(), lr=learning_rate)
 
         # PPO parameters
         self.clip_param = clip_param
@@ -119,7 +148,10 @@ class PPO:
         """
         self.transition = RolloutStorage.Transition()
         obs_size = get_subobs_size(obs_format["policy"])
-        critic_obs_size = get_subobs_size(obs_format.get("critic")) if "critic" in obs_format else None
+        if self.critic_obs_groups is not None:
+            critic_obs_size = sum(get_subobs_size(obs_format[g]) for g in self.critic_obs_groups)
+        else:
+            critic_obs_size = get_subobs_size(obs_format.get("critic")) if "critic" in obs_format else None
         self.storage = RolloutStorage(
             num_envs,
             num_transitions_per_env,
@@ -128,7 +160,15 @@ class PPO:
             [num_actions],
             num_rewards=num_rewards,
             device=self.device,
+            has_value_mask=self.value_mask_group is not None,
         )
+
+    def _get_critic_obs(self, extra_obs: dict[str, torch.Tensor] | None):
+        if extra_obs is None:
+            return None
+        if self.critic_obs_groups is not None:
+            return torch.cat([extra_obs[g] for g in self.critic_obs_groups], dim=-1)
+        return extra_obs.get("critic", None)
 
     def test_mode(self):
         self.actor_critic.test()
@@ -144,7 +184,7 @@ class PPO:
                 The "critic" group, if present, is used as the critic input and stored in the rollout
                 storage. Algorithms may consume additional groups from this dict.
         """
-        critic_obs = extra_obs.get("critic", None) if extra_obs is not None else None
+        critic_obs = self._get_critic_obs(extra_obs)
 
         if self.actor_critic.is_recurrent:
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
@@ -157,6 +197,8 @@ class PPO:
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.critic_observations = critic_obs
+        if self.value_mask_group is not None and extra_obs is not None:
+            self.transition.value_masks = extra_obs[self.value_mask_group]
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos, next_obs, next_extra_obs: dict[str, torch.Tensor] | None):
@@ -198,7 +240,7 @@ class PPO:
             last_extra_obs: all observation groups of the last step (including "policy"). The
                 "critic" group is used if present, otherwise falls back to "policy".
         """
-        last_critic_obs = last_extra_obs.get("critic", None)
+        last_critic_obs = self._get_critic_obs(last_extra_obs)
         last_values = self.actor_critic.evaluate(
             last_critic_obs if last_critic_obs is not None else last_extra_obs["policy"]
         ).detach()
@@ -289,25 +331,63 @@ class PPO:
                     self.learning_rate = lr_tensor.item()
 
                 for param_group in self.optimizer.param_groups:
-                    param_group["lr"] = self.learning_rate
+                    if param_group.get("adaptive", True):
+                        param_group["lr"] = self.learning_rate
 
         # Surrogate loss
         ratio = torch.exp(actions_log_prob_batch - torch.squeeze(minibatch.old_actions_log_prob))
-        mixed_advantages = torch.mean(minibatch.advantages * self.advantage_mixing_weights, dim=-1)
-        surrogate = -mixed_advantages * ratio
-        surrogate_clipped = -mixed_advantages * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
-        surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+        if minibatch.value_masks is not None:
+            v_mask = minibatch.value_masks
+            actor_col = torch.ones(v_mask.shape[-1], device=v_mask.device, dtype=v_mask.dtype)
+            if self.critic_warmup_iterations is not None:
+                for i, w in enumerate(self.critic_warmup_iterations):
+                    if self.current_learning_iteration < w:
+                        actor_col[i] = 0.0
+            actor_mask = v_mask * actor_col
+            mixed_advantages = (minibatch.advantages * actor_mask).sum(dim=-1)
+            surrogate = -mixed_advantages * ratio
+            surrogate_clipped = -mixed_advantages * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+            active = (actor_mask.sum(dim=-1) > 0).to(surrogate.dtype)
+            surrogate_loss = (torch.max(surrogate, surrogate_clipped) * active).sum() / active.sum().clamp_min(1.0)
+        else:
+            mixed_advantages = torch.mean(minibatch.advantages * self.advantage_mixing_weights, dim=-1)
+            surrogate = -mixed_advantages * ratio
+            surrogate_clipped = -mixed_advantages * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
+            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
         # Value function loss
         if self.use_clipped_value_loss:
             value_clipped = minibatch.values + (value_batch - minibatch.values).clamp(-self.clip_param, self.clip_param)
             value_losses = (value_batch - minibatch.returns).pow(2)
             value_losses_clipped = (value_clipped - minibatch.returns).pow(2)
-            value_loss = torch.max(value_losses, value_losses_clipped)
+            value_loss_clipped = torch.max(value_losses, value_losses_clipped)
+            if self.critic_value_clipping is not None or self.critic_warmup_iterations is not None:
+                num_c = value_losses.shape[-1]
+                use_clip = torch.tensor(
+                    [
+                        (self.critic_value_clipping[i] if self.critic_value_clipping is not None else True)
+                        and (
+                            self.current_learning_iteration >= self.critic_warmup_iterations[i]
+                            if self.critic_warmup_iterations is not None
+                            else True
+                        )
+                        for i in range(num_c)
+                    ],
+                    device=value_losses.device,
+                    dtype=torch.bool,
+                )
+                value_loss = torch.where(use_clip, value_loss_clipped, value_losses)
+            else:
+                value_loss = value_loss_clipped
         else:
             value_loss = (minibatch.returns - value_batch).pow(2)
         # preserve the last dimension for multi-reward setting
-        value_loss = value_loss.reshape(-1, value_loss.shape[-1]).mean(dim=0)
+        if minibatch.value_masks is not None:
+            flat_v = value_loss.reshape(-1, value_loss.shape[-1])
+            flat_m = minibatch.value_masks.reshape(-1, value_loss.shape[-1])
+            value_loss = (flat_v * flat_m).sum(dim=0) / flat_m.sum(dim=0).clamp_min(1.0)
+        else:
+            value_loss = value_loss.reshape(-1, value_loss.shape[-1]).mean(dim=0)
 
         # pack the losses and stats
         stats_ = dict()

@@ -100,6 +100,8 @@ class PlannerAlgoMixin:
         planner_replay_capacity: int = 100_000,
         planner_replay_num_partitions: int | None = None,
         planner_replay_partition_capacity: int = 2000,
+        planner_goal_replay_kwargs: dict | None = None,
+        planner_critic_targets: list[tuple[str, Sequence[str]]] | None = None,
         planner_replay_device: str | None = None,
         planner_replay_checkpoint: str = "latest",
         **kwargs,
@@ -136,11 +138,17 @@ class PlannerAlgoMixin:
         self.planner_replay_capacity = int(planner_replay_capacity)
         self.planner_replay_num_partitions = planner_replay_num_partitions
         self.planner_replay_partition_capacity = int(planner_replay_partition_capacity)
+        self.planner_goal_replay_kwargs = dict(planner_goal_replay_kwargs) if planner_goal_replay_kwargs else None
+        self.planner_critic_targets = list(planner_critic_targets) if planner_critic_targets else []
         self.planner_replay_device = planner_replay_device if planner_replay_device is not None else self.device
         self.planner_replay_checkpoint = planner_replay_checkpoint
         self.policy_normalizer: EmpiricalNormalization | None = None
+        self._group_normalizers: dict[str, EmpiricalNormalization] = {}
+        self._critic_target_indices: dict[str, torch.Tensor] = {}
+        self.planner_goal_replay: PartitionedReplayBuffer | None = None
         self._policy_feedback: dict[str, torch.Tensor] | None = None
         self._planner_samples_this_iteration = 0
+        self._planner_goal_samples_this_iteration = 0
         # samples ever added; pairs a checkpoint with its replay sidecar
         self._planner_samples_total = 0
 
@@ -157,6 +165,7 @@ class PlannerAlgoMixin:
         if normalizer is not None and not isinstance(normalizer, EmpiricalNormalization):
             raise TypeError(f"the policy normalizer must be an EmpiricalNormalization, got {type(normalizer).__name__}")
         self.policy_normalizer = normalizer
+        self._group_normalizers = {k: v for k, v in normalizers.items() if isinstance(v, EmpiricalNormalization)}
 
     def init_storage(self, num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards=1):
         super().init_storage(num_envs, num_transitions_per_env, obs_format, num_actions, num_rewards)
@@ -197,7 +206,9 @@ class PlannerAlgoMixin:
             "target_valid": TensorSpec((num_bodies,), torch.bool),
         }
         if self.planner_replay_num_partitions is None:
-            self.planner_replay = FifoReplayBuffer(self.planner_replay_capacity, specs, device=self.planner_replay_device)
+            self.planner_replay = FifoReplayBuffer(
+                self.planner_replay_capacity, specs, device=self.planner_replay_device
+            )
         else:
             self.planner_replay = PartitionedReplayBuffer(
                 self.planner_replay_num_partitions,
@@ -205,9 +216,54 @@ class PlannerAlgoMixin:
                 specs,
                 device=self.planner_replay_device,
             )
+        if self.planner_goal_replay_kwargs is not None:
+            goal_kwargs = dict(self.planner_goal_replay_kwargs)
+            goal_kwargs.setdefault("eviction", "quality")
+            self.planner_goal_replay = PartitionedReplayBuffer(
+                specs=specs, device=self.planner_replay_device, **goal_kwargs
+            )
+        self._critic_target_indices = {}
+        for group_name, components in self.planner_critic_targets:
+            idx = get_subobs_indexing_by_components(obs_format[group_name], list(components)).to(self.device)
+            if idx.numel() != self.planner.output_size:
+                raise ValueError(
+                    f"planner_critic_targets {group_name}:{components} has {idx.numel()} elements,"
+                    f" expected {self.planner.output_size}"
+                )
+            self._critic_target_indices[group_name] = idx
+
+    def _inject_critic_targets(
+        self, extra_obs: dict[str, torch.Tensor], positions: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        if not self._critic_target_indices:
+            return extra_obs
+        raw_targets = positions.reshape(positions.shape[0], -1)
+        patched = dict(extra_obs)
+        for group_name, idx in self._critic_target_indices.items():
+            if group_name not in patched:
+                continue
+            t = raw_targets
+            norm = self._group_normalizers.get(group_name)
+            if norm is not None:
+                t = (t - norm.mean[idx]) / (norm.std[idx] + norm.eps)
+            buf = patched[group_name].clone()
+            buf[:, idx] = t
+            patched[group_name] = buf
+        return patched
 
     def act(self, obs, extra_obs):
-        return super().act(self.compose_policy_obs(obs, extra_obs, target_noise=True), extra_obs)
+        composed = self.compose_policy_obs(obs, extra_obs, target_noise=True)
+        patched_extra = self._inject_critic_targets(
+            extra_obs, self._policy_feedback[self.planner_positions_feedback_key]
+        )
+        return super().act(composed, patched_extra)
+
+    def compute_returns(self, last_extra_obs: dict[str, torch.Tensor]):
+        if self._critic_target_indices:
+            with torch.no_grad():
+                positions, _ = self.planner.predict(last_extra_obs[self.planner_obs_group])
+            last_extra_obs = self._inject_critic_targets(last_extra_obs, positions)
+        return super().compute_returns(last_extra_obs)
 
     def compose_policy_obs(self, obs, extra_obs, target_noise: bool) -> torch.Tensor:
         """The (normalized) policy obs with the planner's targets in the target slot where the gate is set.
@@ -242,23 +298,64 @@ class PlannerAlgoMixin:
 
     def process_env_step(self, rewards, dones, infos, next_obs, next_extra_obs):
         samples = infos.pop(self.planner_samples_key)
-        keys = PLANNER_SAMPLE_KEYS if self.planner_replay_num_partitions is None else PARTITIONED_SAMPLE_KEYS
-        added = self.planner_replay.add({k: samples[k] for k in keys})
-        self._planner_samples_this_iteration += added
-        self._planner_samples_total += added
+        if self.planner_goal_replay is not None and "buffer_id" in samples:
+            buf_id = samples["buffer_id"]
+            ref_mask = buf_id == 0
+            goal_mask = buf_id == 1
+            ref_keys = PLANNER_SAMPLE_KEYS if self.planner_replay_num_partitions is None else PARTITIONED_SAMPLE_KEYS
+            added_ref = (
+                self.planner_replay.add({k: samples[k][ref_mask] for k in ref_keys}) if bool(ref_mask.any()) else 0
+            )
+            goal_keys = PARTITIONED_SAMPLE_KEYS + (
+                ("quality",) if self.planner_goal_replay.eviction == "quality" else ()
+            )
+            added_goal = (
+                self.planner_goal_replay.add({k: samples[k][goal_mask] for k in goal_keys})
+                if bool(goal_mask.any())
+                else 0
+            )
+            self._planner_samples_this_iteration += added_ref
+            self._planner_goal_samples_this_iteration += added_goal
+            self._planner_samples_total += added_ref + added_goal
+        else:
+            keys = PLANNER_SAMPLE_KEYS if self.planner_replay_num_partitions is None else PARTITIONED_SAMPLE_KEYS
+            added = self.planner_replay.add({k: samples[k] for k in keys})
+            self._planner_samples_this_iteration += added
+            self._planner_samples_total += added
         super().process_env_step(rewards, dones, infos, next_obs, next_extra_obs)
 
     def _planner_ready(self) -> bool:
-        size = torch.tensor(len(self.planner_replay), device=self.device)
+        total = len(self.planner_replay) + (
+            len(self.planner_goal_replay) if self.planner_goal_replay is not None else 0
+        )
+        size = torch.tensor(total, device=self.device)
         if dist.is_initialized():
             dist.all_reduce(size, op=dist.ReduceOp.MIN)
         return int(size) >= self.planner_min_samples
+
+    def _sample_planner_batch(self, batch_size: int) -> dict[str, torch.Tensor]:
+        n_ref = len(self.planner_replay)
+        n_goal = len(self.planner_goal_replay) if self.planner_goal_replay is not None else 0
+        if n_goal == 0:
+            return self.planner_replay.sample(batch_size)
+        if n_ref == 0:
+            return self.planner_goal_replay.sample(batch_size)
+        b_goal = int(round(batch_size * n_goal / (n_ref + n_goal)))
+        b_goal = max(1, min(batch_size - 1, b_goal))
+        b_ref = batch_size - b_goal
+        ref_b = self.planner_replay.sample(b_ref)
+        goal_b = self.planner_goal_replay.sample(b_goal)
+        return {k: torch.cat([ref_b[k], goal_b[k]], dim=0) for k in ref_b}
 
     def update(self, *args, **kwargs):
         mean_losses, average_stats = super().update(*args, **kwargs)
         average_stats["planner_replay_size"] = torch.tensor(float(len(self.planner_replay)))
         average_stats["planner_samples_added"] = torch.tensor(float(self._planner_samples_this_iteration))
         self._planner_samples_this_iteration = 0
+        if self.planner_goal_replay is not None:
+            average_stats["planner_goal_replay_size"] = torch.tensor(float(len(self.planner_goal_replay)))
+            average_stats["planner_goal_samples_added"] = torch.tensor(float(self._planner_goal_samples_this_iteration))
+            self._planner_goal_samples_this_iteration = 0
         if not self._planner_ready():
             return mean_losses, average_stats
 
@@ -266,7 +363,7 @@ class PlannerAlgoMixin:
         sums = defaultdict(float)
         sub_batch = self.planner_batch_size // self.planner_accumulation_steps
         for _ in range(self.planner_num_updates):
-            batch = self.planner_replay.sample(self.planner_batch_size)
+            batch = self._sample_planner_batch(self.planner_batch_size)
             batch = {k: v.to(self.device) for k, v in batch.items()}
             self.planner_optimizer.zero_grad()
             for start in range(0, self.planner_batch_size, sub_batch):
@@ -276,6 +373,8 @@ class PlannerAlgoMixin:
                 for k, v in {**losses, **stats}.items():
                     sums[k] += v.detach() / self.planner_accumulation_steps
             self._planner_gradient_step(sums)
+        if self.planner.context_normalizer is not None and dist.is_initialized():
+            self.planner.context_normalizer.sync_across_processes()
         for k, v in sums.items():
             target = average_stats if k in ("top1_error", "occupancy_accuracy", "grad_norm") else mean_losses
             target[f"planner_{k}"] = v / self.planner_num_updates
@@ -333,6 +432,8 @@ class PlannerAlgoMixin:
             return
         path = os.path.join(directory, self.REPLAY_FILE)
         state = {"samples_total": self._planner_samples_total, "replay_state_dict": self.planner_replay.state_dict()}
+        if self.planner_goal_replay is not None:
+            state["goal_replay_state_dict"] = self.planner_goal_replay.state_dict()
         torch.save(state, path + ".tmp")
         os.replace(path + ".tmp", path)
 
@@ -348,6 +449,8 @@ class PlannerAlgoMixin:
             print(f"[PlannerAlgoMixin] {path} does not belong to the loaded checkpoint; starting with an empty replay")
             return
         self.planner_replay.load_state_dict(saved["replay_state_dict"])
+        if self.planner_goal_replay is not None and "goal_replay_state_dict" in saved:
+            self.planner_goal_replay.load_state_dict(saved["goal_replay_state_dict"])
 
     def export_as_onnx(self, obs: torch.Tensor, extra_obs: dict[str, torch.Tensor], export_dir: str) -> None:
         """Runner hook: the actor files as usual, plus ``planner.onnx`` (input: the flat planner observation)."""

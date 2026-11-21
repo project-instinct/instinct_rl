@@ -510,7 +510,7 @@ class OnPolicyRunner:
     def load(self, path):
         """Load training state dict from file. (even for multi-processes)"""
 
-        loaded_dict = torch.load(path, weights_only=True)
+        loaded_dict = torch.load(path, weights_only=True, map_location=self.device)
         if self.cfg.get("ckpt_manipulator", False):
             # suppose to be a string specifying which function to use
             if not self.is_mp_rank_other_process():

@@ -486,13 +486,17 @@ class PartitionedReplayBuffer:
         capacity_per_partition: int,
         specs: dict[str, TensorSpec],
         device: str | torch.device = "cpu",
+        eviction: str = "fifo",
     ):
         if num_partitions <= 0 or capacity_per_partition <= 0:
             raise ValueError("num_partitions and capacity_per_partition must be positive")
+        if eviction not in ("fifo", "quality"):
+            raise ValueError(f"eviction must be 'fifo' or 'quality', got {eviction!r}")
         self.num_partitions = int(num_partitions)
         self.capacity_per_partition = int(capacity_per_partition)
         self.specs = dict(specs)
         self.device = torch.device(device)
+        self.eviction = eviction
         shape = (self.num_partitions, self.capacity_per_partition)
         self._buffers = {
             name: torch.zeros(*shape, *spec.shape, dtype=spec.dtype, device=self.device)
@@ -501,11 +505,18 @@ class PartitionedReplayBuffer:
         self._cursor = torch.zeros(self.num_partitions, dtype=torch.long, device=self.device)
         self._filled = torch.zeros(self.num_partitions, dtype=torch.long, device=self.device)
         self._group = torch.full((self.num_partitions,), -1, dtype=torch.long, device=self.device)
+        self._quality = (
+            torch.full(shape, -float("inf"), dtype=torch.float32, device=self.device)
+            if self.eviction == "quality"
+            else None
+        )
 
     def add(self, samples: dict[str, torch.Tensor]) -> int:
-        """Append ``{name: (K, *spec.shape)}`` plus ``partition`` / ``group`` ``(K,)``; returns K. Of more than
-        ``capacity_per_partition`` samples of one partition only the last ones are kept."""
+        """Append ``{name: (K, *spec.shape)}`` plus ``partition`` / ``group`` ``(K,)`` (and ``quality`` ``(K,)``
+        when ``eviction='quality'``); returns K."""
         expected = set(self.specs) | {"partition", "group"}
+        if self.eviction == "quality":
+            expected = expected | {"quality"}
         if set(samples) != expected:
             raise KeyError(f"samples have keys {sorted(samples)}, expected {sorted(expected)}")
         partition = samples["partition"].to(device=self.device, dtype=torch.long)
@@ -519,6 +530,28 @@ class PartitionedReplayBuffer:
             return 0
         if bool(((partition < 0) | (partition >= self.num_partitions)).any()):
             raise ValueError(f"partition ids must be in [0, {self.num_partitions})")
+        if self.eviction == "quality":
+            quality = samples["quality"].to(device=self.device, dtype=torch.float32)
+            assert self._quality is not None
+            for p_val in torch.unique(partition).tolist():
+                p_mask = partition == p_val
+                n_old = int(self._filled[p_val].item())
+                n_new = int(p_mask.sum().item())
+                q_all = torch.cat([self._quality[p_val, :n_old], quality[p_mask]], dim=0)
+                keep_n = min(n_old + n_new, self.capacity_per_partition)
+                top_q, top_idx = torch.topk(q_all, k=keep_n, largest=True, sorted=False)
+                self._quality[p_val, :keep_n] = top_q
+                if keep_n < self.capacity_per_partition:
+                    self._quality[p_val, keep_n:] = -float("inf")
+                for name, buffer in self._buffers.items():
+                    combined = torch.cat(
+                        [buffer[p_val, :n_old], samples[name][p_mask].to(device=self.device, dtype=buffer.dtype)],
+                        dim=0,
+                    )
+                    buffer[p_val, :keep_n] = combined[top_idx]
+                self._filled[p_val] = keep_n
+                self._group[p_val] = group[p_mask][-1]
+            return num
         # rank of each sample within its partition, in arrival order (stable sort keeps the order)
         order = torch.sort(partition, stable=True).indices
         sorted_partition = partition[order]
@@ -571,12 +604,17 @@ class PartitionedReplayBuffer:
             "filled": self._filled,
             "group": self._group,
         }
+        if self._quality is not None:
+            state["quality"] = self._quality
         for name, buffer in self._buffers.items():
             state[f"buffer/{name}"] = buffer
         return state
 
     def load_state_dict(self, state: dict) -> None:
-        for key, value in (("num_partitions", self.num_partitions), ("capacity_per_partition", self.capacity_per_partition)):
+        for key, value in (
+            ("num_partitions", self.num_partitions),
+            ("capacity_per_partition", self.capacity_per_partition),
+        ):
             if int(state[key]) != value:
                 raise ValueError(f"replay {key} mismatch: checkpoint {state[key]}, current {value}")
         for name, buffer in self._buffers.items():
@@ -588,6 +626,8 @@ class PartitionedReplayBuffer:
             buffer.copy_(saved.to(dtype=buffer.dtype, device=buffer.device))
         for key in ("cursor", "filled", "group"):
             getattr(self, f"_{key}").copy_(state[key].to(self.device))
+        if self._quality is not None and "quality" in state:
+            self._quality.copy_(state["quality"].to(dtype=self._quality.dtype, device=self.device))
 
     def __repr__(self) -> str:
         return (

@@ -227,3 +227,31 @@ def add_missing_algorithm_state(source_state_dict: dict, algo_state_dict: dict):
         new_state_dict[key] = algo_state_dict[key]
     new_state_dict["iter"] = 0
     return new_state_dict
+
+
+def add_goal_critic(source_state_dict: dict, algo_state_dict: dict):
+    """Transition a single-critic Stage-2 checkpoint into a two-critic Stage-3 checkpoint.
+
+    Renames ``critic.*`` weights in ``model_state_dict`` to ``critics.0.*``, takes the fresh ``critics.1.*`` weights
+    and fresh optimizer state from ``algo_state_dict``, preserves planner/actor/normalizer weights, and resets ``iter``
+    to 0. If ``model_state_dict`` already has ``critics.0.`` keys (resuming Stage 3), returns unchanged.
+    """
+    src_model = source_state_dict.get("model_state_dict", {})
+    if any(k.startswith("critics.0.") for k in src_model):
+        print("\033[1;36m Checkpoint already has multi-critic weights; loading unchanged \033[0m")
+        return source_state_dict
+    new_state_dict = dict(source_state_dict)
+    new_model = dict(algo_state_dict["model_state_dict"])
+    for k, v in src_model.items():
+        if k.startswith("critic."):
+            new_model["critics.0." + k[len("critic.") :]] = v
+        elif k in new_model:
+            new_model[k] = v
+    new_state_dict["model_state_dict"] = new_model
+    new_state_dict["optimizer_state_dict"] = algo_state_dict["optimizer_state_dict"]
+    for k in algo_state_dict:
+        if k not in new_state_dict:
+            new_state_dict[k] = algo_state_dict[k]
+    new_state_dict["iter"] = 0
+    print("\033[1;36m Renamed critic.* -> critics.0.*, initialized critics.1.* and optimizer; iter reset to 0 \033[0m")
+    return new_state_dict

@@ -55,6 +55,7 @@ class RolloutStorage:
             self.action_mean = None
             self.action_sigma = None
             self.hidden_states = None
+            self.value_masks = None
 
         def clear(self):
             self.__init__()
@@ -73,11 +74,21 @@ class RolloutStorage:
             "old_sigma",
             "hidden_states",
             "masks",
+            "value_masks",
         ],
+        defaults=(None,),
     )
 
     def __init__(
-        self, num_envs, num_transitions_per_env, obs_shape, critic_obs_shape, actions_shape, num_rewards=1, device="cpu"
+        self,
+        num_envs,
+        num_transitions_per_env,
+        obs_shape,
+        critic_obs_shape,
+        actions_shape,
+        num_rewards=1,
+        device="cpu",
+        has_value_mask: bool = False,
     ):
         self.device = device
 
@@ -105,6 +116,9 @@ class RolloutStorage:
         self.advantages = torch.zeros(num_transitions_per_env, num_envs, num_rewards, device=self.device)
         self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
+        self.value_masks = (
+            torch.ones(num_transitions_per_env, num_envs, num_rewards, device=self.device) if has_value_mask else None
+        )
 
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
@@ -127,6 +141,8 @@ class RolloutStorage:
         self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
         self.mu[self.step].copy_(transition.action_mean)
         self.sigma[self.step].copy_(transition.action_sigma)
+        if self.value_masks is not None and transition.value_masks is not None:
+            self.value_masks[self.step].copy_(transition.value_masks.view(-1, self.num_rewards))
         self._save_hidden_states(transition.hidden_states)
         self.step += 1
 
@@ -164,7 +180,14 @@ class RolloutStorage:
 
         # Compute and normalize the advantages
         self.advantages = self.returns - self.values
-        self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
+        if self.value_masks is not None:
+            mask = self.value_masks
+            count = mask.sum(dim=(0, 1), keepdim=True).clamp_min(1.0)
+            mean = (self.advantages * mask).sum(dim=(0, 1), keepdim=True) / count
+            var = ((self.advantages - mean).square() * mask).sum(dim=(0, 1), keepdim=True) / count
+            self.advantages = ((self.advantages - mean) / (var.sqrt() + 1e-8)) * mask
+        else:
+            self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
 
     def get_statistics(self):
         done = self.dones
@@ -271,6 +294,7 @@ class RolloutStorage:
         advantage_batch = self.advantages[T_select, B_select]
         old_mu_batch = self.mu[T_select, B_select]
         old_sigma_batch = self.sigma[T_select, B_select]
+        value_mask_batch = self.value_masks[T_select, B_select] if self.value_masks is not None else None
 
         return RolloutStorage.MiniBatch(
             obs_batch,
@@ -284,6 +308,7 @@ class RolloutStorage:
             old_sigma_batch,
             hid_batch,
             obs_mask_batch,
+            value_mask_batch,
         )
 
 
